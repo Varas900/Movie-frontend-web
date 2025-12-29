@@ -1,0 +1,43 @@
+# Root Gitignore for Flutter Web project
+
+# Flutter/Dart
+.dart_tool/
+.packages
+.pub/
+.pub-cache/
+Web/.dart_tool/
+Web/.flutter-plugins
+Web/.flutter-plugins-dependencies
+Web/.metadata
+
+# Builds
+build/
+Web/build/
+Web/build/**
+
+# Node.js
+**/node_modules/
+Web/dev_proxy/node_modules/
+Web/dev_proxy/package-lock.json
+
+# IDE
+.vscode/
+Web/.vscode/
+.idea/
+*.iml
+*.ipr
+*.iws
+
+# OS & misc
+.DS_Store
+*.log
+
+# Generated files
+**/generated_plugin_registrant.dart
+
+# Android/iOS/macOS/windows (if present)
+android/
+ios/
+macos/
+linux/
+windows/
