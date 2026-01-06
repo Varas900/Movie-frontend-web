@@ -29,6 +29,135 @@ class _CommentsSectionState extends ConsumerState<CommentsSection> {
   int? _replyingTo;
   bool _isPosting = false;
 
+  Future<void> _editComment(Comment c) async {
+    final ctrl = TextEditingController(text: c.content);
+    final repo = ref.read(commentsRepositoryProvider);
+
+    final result = await showDialog<String>(
+      context: context,
+      builder: (dialogCtx) => AlertDialog(
+        title: const Text('Edit comment'),
+        content: SizedBox(
+          width: 520,
+          child: TextField(
+            controller: ctrl,
+            minLines: 3,
+            maxLines: 6,
+            decoration: const InputDecoration(border: OutlineInputBorder()),
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(dialogCtx).pop(),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(dialogCtx).pop(ctrl.text.trim()),
+            child: const Text('Save'),
+          ),
+        ],
+      ),
+    );
+
+    final text = result?.trim();
+    if (text == null || text.isEmpty || text == c.content) return;
+
+    try {
+      final ok = await repo.updateComment(comment: c, content: text);
+      if (ok) {
+        ref.invalidate(commentsProvider(widget.movieId));
+      }
+    } catch (e) {
+      final prompt = authzPromptFromError(e);
+      if (prompt == AuthzPromptType.signIn) {
+        if (!mounted) return;
+        await showAuthzPromptDialog(
+          context,
+          type: AuthzPromptType.signIn,
+          onPrimary: () async {
+            await ref.read(authProvider.notifier).signOut();
+            if (context.mounted) context.go(AppRoutes.signin);
+          },
+        );
+        return;
+      }
+      if (prompt == AuthzPromptType.buyPlan) {
+        if (!mounted) return;
+        await showAuthzPromptDialog(
+          context,
+          type: AuthzPromptType.buyPlan,
+          onPrimary: () => context.go('${AppRoutes.profile}?tab=subscription'),
+        );
+        return;
+      }
+
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Failed to update comment: $e')),
+        );
+      }
+    }
+  }
+
+  Future<void> _deleteComment(Comment c) async {
+    final repo = ref.read(commentsRepositoryProvider);
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogCtx) => AlertDialog(
+        title: const Text('Delete comment'),
+        content: const Text('Delete this comment?'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(dialogCtx).pop(false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            style: FilledButton.styleFrom(backgroundColor: Colors.red),
+            onPressed: () => Navigator.of(dialogCtx).pop(true),
+            child: const Text('Delete'),
+          ),
+        ],
+      ),
+    );
+
+    if (confirmed != true) return;
+    try {
+      final ok = await repo.deleteComment(commentId: c.commentID);
+      if (ok) {
+        ref.invalidate(commentsProvider(widget.movieId));
+      }
+    } catch (e) {
+      final prompt = authzPromptFromError(e);
+      if (prompt == AuthzPromptType.signIn) {
+        if (!mounted) return;
+        await showAuthzPromptDialog(
+          context,
+          type: AuthzPromptType.signIn,
+          onPrimary: () async {
+            await ref.read(authProvider.notifier).signOut();
+            if (context.mounted) context.go(AppRoutes.signin);
+          },
+        );
+        return;
+      }
+      if (prompt == AuthzPromptType.buyPlan) {
+        if (!mounted) return;
+        await showAuthzPromptDialog(
+          context,
+          type: AuthzPromptType.buyPlan,
+          onPrimary: () => context.go('${AppRoutes.profile}?tab=subscription'),
+        );
+        return;
+      }
+
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Failed to delete comment: $e')),
+        );
+      }
+    }
+  }
+
   @override
   void dispose() {
     _controller.dispose();
@@ -220,6 +349,25 @@ class _CommentsSectionState extends ConsumerState<CommentsSection> {
                         Text(displayName ?? 'User', style: Theme.of(context).textTheme.titleSmall),
                         const SizedBox(width: 8),
                         Text(_formatDate(c.createdAt), style: Theme.of(context).textTheme.bodySmall),
+                        const Spacer(),
+                        if (isMe)
+                          PopupMenuButton<String>(
+                            tooltip: 'Comment actions',
+                            onSelected: (v) async {
+                              switch (v) {
+                                case 'edit':
+                                  await _editComment(c);
+                                  break;
+                                case 'delete':
+                                  await _deleteComment(c);
+                                  break;
+                              }
+                            },
+                            itemBuilder: (ctx) => const [
+                              PopupMenuItem(value: 'edit', child: Text('Edit')),
+                              PopupMenuItem(value: 'delete', child: Text('Delete')),
+                            ],
+                          ),
                       ],
                     ),
                     const SizedBox(height: 4),
@@ -376,6 +524,25 @@ class _CommentsSectionState extends ConsumerState<CommentsSection> {
                             style: Theme.of(context).textTheme.titleSmall),
                         const SizedBox(width: 8),
                         Text(_formatDate(r.createdAt), style: Theme.of(context).textTheme.bodySmall),
+                        const Spacer(),
+                        if (isMe)
+                          PopupMenuButton<String>(
+                            tooltip: 'Comment actions',
+                            onSelected: (v) async {
+                              switch (v) {
+                                case 'edit':
+                                  await _editComment(r);
+                                  break;
+                                case 'delete':
+                                  await _deleteComment(r);
+                                  break;
+                              }
+                            },
+                            itemBuilder: (ctx) => const [
+                              PopupMenuItem(value: 'edit', child: Text('Edit')),
+                              PopupMenuItem(value: 'delete', child: Text('Delete')),
+                            ],
+                          ),
                       ],
                     ),
                     const SizedBox(height: 4),

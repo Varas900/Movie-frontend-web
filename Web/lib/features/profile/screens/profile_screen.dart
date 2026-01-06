@@ -94,21 +94,32 @@ class _ProfileOverview extends ConsumerWidget {
   final User user;
   const _ProfileOverview({required this.user});
 
-  String _formatDate(dynamic value) {
+  String _formatDob(dynamic value) {
     if (value == null) return '—';
-    final s = value.toString();
+    final s = value.toString().trim();
     if (s.isEmpty) return '—';
     final dt = DateTime.tryParse(s);
     if (dt == null) return s;
-    return DateFormat('yyyy-MM-dd').format(dt);
+    return DateFormat('dd/MM/yyyy').format(dt);
   }
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
-    final name = user.fullDisplayName.isNotEmpty ? user.fullDisplayName : user.userName;
-    final verified = user.isEmailVerified == true;
-    final roleLabel = _roleToString(user.role);
-    final statusLabel = _statusToString(user.status);
+    String dashIfEmpty(String? v) {
+      final s = (v ?? '').trim();
+      return s.isEmpty ? '—' : s;
+    }
+
+    Widget field({required String label, required String value}) {
+      return Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(label, style: Theme.of(context).textTheme.labelLarge),
+          const SizedBox(height: 6),
+          Text(value, style: Theme.of(context).textTheme.bodyLarge),
+        ],
+      );
+    }
 
     return Center(
       child: ConstrainedBox(
@@ -121,55 +132,35 @@ class _ProfileOverview extends ConsumerWidget {
               color: Theme.of(context).colorScheme.surface,
               child: Padding(
                 padding: const EdgeInsets.all(20),
-                child: Row(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    CircleAvatar(
-                      radius: 36,
-                      child: Text(
-                        user.initials,
-                        style: const TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
-                      ),
+                    field(label: 'Username', value: user.userName),
+                    const SizedBox(height: 16),
+                    Row(
+                      children: [
+                        Expanded(
+                          child: field(
+                            label: 'First name',
+                            value: dashIfEmpty(user.firstName),
+                          ),
+                        ),
+                        const SizedBox(width: 12),
+                        Expanded(
+                          child: field(
+                            label: 'Last name',
+                            value: dashIfEmpty(user.lastName),
+                          ),
+                        ),
+                      ],
                     ),
-                    const SizedBox(width: 16),
-                    Expanded(
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Text(
-                            name,
-                            style: Theme.of(context).textTheme.titleLarge?.copyWith(fontWeight: FontWeight.w800),
-                          ),
-                          const SizedBox(height: 4),
-                          Text(
-                            user.email,
-                            style: Theme.of(context).textTheme.bodyMedium,
-                          ),
-                          const SizedBox(height: 10),
-                          Wrap(
-                            spacing: 8,
-                            runSpacing: 8,
-                            children: [
-                              _Chip(label: roleLabel, color: Colors.blue),
-                              _Chip(label: statusLabel, color: Colors.green),
-                              _Chip(label: verified ? 'Verified' : 'Unverified', color: verified ? Colors.green : Colors.orange),
-                            ],
-                          ),
-                        ],
-                      ),
-                    ),
+                    const SizedBox(height: 16),
+                    field(label: 'Gender', value: dashIfEmpty(user.gender)),
+                    const SizedBox(height: 16),
+                    field(label: 'Date of birth', value: _formatDob(user.dateOfBirth)),
                   ],
                 ),
               ),
-            ),
-            const SizedBox(height: 12),
-            Wrap(
-              spacing: 12,
-              runSpacing: 12,
-              children: [
-                _InfoCard(icon: Icons.calendar_today, title: 'Created', value: _formatDate(user.createdAt)),
-                _InfoCard(icon: Icons.login, title: 'Last login', value: _formatDate(user.lastLogin)),
-                _InfoCard(icon: Icons.person, title: 'Username', value: user.userName),
-              ],
             ),
           ],
         ),
@@ -510,43 +501,6 @@ class _ProfileSettingsState extends ConsumerState<_ProfileSettings> {
               ),
             ),
 
-            const SizedBox(height: 12),
-
-            Card(
-              elevation: 0,
-              child: Padding(
-                padding: const EdgeInsets.all(16),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: const [
-                    Text('Preferences', style: TextStyle(fontWeight: FontWeight.w700)),
-                    SizedBox(height: 8),
-                    Text('Notification and theme preferences will be added later.'),
-                  ],
-                ),
-              ),
-            ),
-
-            const SizedBox(height: 12),
-
-            Card(
-              elevation: 0,
-              child: Padding(
-                padding: const EdgeInsets.all(16),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    const Text('Danger Zone', style: TextStyle(fontWeight: FontWeight.w700)),
-                    const SizedBox(height: 8),
-                    OutlinedButton.icon(
-                      onPressed: _saving ? null : () => _confirmDeleteAccount(context, ref, user),
-                      icon: const Icon(Icons.delete_forever, color: Colors.red),
-                      label: const Text('Delete Account'),
-                    ),
-                  ],
-                ),
-              ),
-            ),
           ],
         ),
       ),
@@ -1522,76 +1476,6 @@ void _showEditProfileDialog(BuildContext context, WidgetRef ref, User user) {
                       child: CircularProgressIndicator(strokeWidth: 2),
                     )
                   : const Text('Save'),
-            ),
-          ],
-        );
-      },
-    ),
-  );
-}
-
-void _confirmDeleteAccount(BuildContext context, WidgetRef ref, User user) {
-  final userService = UserService();
-  bool deleting = false;
-  String? error;
-
-  showDialog(
-    context: context,
-    builder: (dialogCtx) => StatefulBuilder(
-      builder: (dialogCtx, setState) {
-        return AlertDialog(
-          title: const Text('Delete account'),
-          content: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              const Text('This action cannot be undone.'),
-              const SizedBox(height: 8),
-              Text('User: ${user.userName}'),
-              if (error != null) ...[
-                const SizedBox(height: 8),
-                Text(error!, style: const TextStyle(color: Colors.red)),
-              ],
-            ],
-          ),
-          actions: [
-            TextButton(
-              onPressed: deleting ? null : () => Navigator.of(dialogCtx).pop(),
-              child: const Text('Cancel'),
-            ),
-            FilledButton(
-              style: FilledButton.styleFrom(backgroundColor: Colors.red),
-              onPressed: deleting
-                  ? null
-                  : () async {
-                      setState(() {
-                        deleting = true;
-                        error = null;
-                      });
-                      try {
-                        await userService.deleteAccount(userId: user.userId);
-                        await ref.read(authProvider.notifier).signOut();
-                        if (dialogCtx.mounted) Navigator.of(dialogCtx).pop();
-                        if (context.mounted) {
-                          ScaffoldMessenger.of(context).showSnackBar(
-                            const SnackBar(content: Text('Account deleted')),
-                          );
-                          context.go(AppRoutes.signin);
-                        }
-                      } catch (e) {
-                        setState(() {
-                          error = e.toString();
-                          deleting = false;
-                        });
-                      }
-                    },
-              child: deleting
-                  ? const SizedBox(
-                      width: 18,
-                      height: 18,
-                      child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white),
-                    )
-                  : const Text('Delete'),
             ),
           ],
         );

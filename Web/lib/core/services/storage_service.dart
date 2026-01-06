@@ -7,6 +7,11 @@ class StorageService {
 	static SharedPreferences? _prefs;
 	static const String _kUserToken = 'auth.userToken';
 	static const String _kPermissions = 'auth.permissions';
+	static const String _kLanguage = 'app.languageCode';
+	static const String _kThemeMode = 'app.themeMode';
+	static const String _kVideoQuality = 'player.videoQuality';
+	static const String _kAutoPlay = 'player.autoPlay';
+	static const String _kSubtitlesEnabled = 'player.subtitlesEnabled';
 
 	static dynamic _userJson;
 	static String? _userToken;
@@ -26,6 +31,72 @@ class StorageService {
 					.where((e) => e.isNotEmpty)
 					.toSet();
 		}
+	}
+
+	static String getLanguage() {
+		final code = _prefs?.getString(_kLanguage);
+		return (code == null || code.isEmpty) ? 'en' : code;
+	}
+
+	static void saveLanguage(String languageCode) {
+		_prefs?.setString(_kLanguage, languageCode);
+	}
+
+	static String? getThemeMode() {
+		final mode = _prefs?.getString(_kThemeMode);
+		return (mode == null || mode.isEmpty) ? null : mode;
+	}
+
+	static void saveThemeMode(String themeMode) {
+		_prefs?.setString(_kThemeMode, themeMode);
+	}
+
+	static double getWatchProgress(int movieId) {
+		final v = _prefs?.getDouble('player.watchProgress.$movieId');
+		return v ?? 0.0;
+	}
+
+	static Future<void> saveWatchProgress(int movieId, double progress) async {
+		final prefs = _prefs ?? await SharedPreferences.getInstance();
+		_prefs = prefs;
+		await prefs.setDouble('player.watchProgress.$movieId', progress);
+	}
+
+	static Future<void> markAsWatched(int movieId) async {
+		final prefs = _prefs ?? await SharedPreferences.getInstance();
+		_prefs = prefs;
+		await prefs.setBool('player.watched.$movieId', true);
+	}
+
+	static String getVideoQuality() {
+		final q = _prefs?.getString(_kVideoQuality);
+		return (q == null || q.isEmpty) ? 'auto' : q;
+	}
+
+	static bool getAutoPlay() {
+		return _prefs?.getBool(_kAutoPlay) ?? true;
+	}
+
+	static bool getSubtitlesEnabled() {
+		return _prefs?.getBool(_kSubtitlesEnabled) ?? true;
+	}
+
+	static Future<void> saveVideoQuality(String quality) async {
+		final prefs = _prefs ?? await SharedPreferences.getInstance();
+		_prefs = prefs;
+		await prefs.setString(_kVideoQuality, quality);
+	}
+
+	static Future<void> saveAutoPlay(bool autoPlay) async {
+		final prefs = _prefs ?? await SharedPreferences.getInstance();
+		_prefs = prefs;
+		await prefs.setBool(_kAutoPlay, autoPlay);
+	}
+
+	static Future<void> saveSubtitlesEnabled(bool enabled) async {
+		final prefs = _prefs ?? await SharedPreferences.getInstance();
+		_prefs = prefs;
+		await prefs.setBool(_kSubtitlesEnabled, enabled);
 	}
 
 	// Minimal storage for auth. Token is persisted; userJson remains in-memory.

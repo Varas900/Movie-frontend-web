@@ -4454,6 +4454,151 @@ class _CommentsDemoWidgetState extends State<CommentsDemoWidget> {
     }
   }
 
+  Future<void> _editComment(CommentDemo c) async {
+    final ctrl = TextEditingController(text: c.content);
+    final result = await showDialog<String>(
+      context: context,
+      builder: (dialogCtx) => AlertDialog(
+        backgroundColor: Colors.grey[900],
+        title: const Text('Edit comment', style: TextStyle(color: Colors.white)),
+        content: SizedBox(
+          width: 520,
+          child: TextField(
+            controller: ctrl,
+            minLines: 3,
+            maxLines: 6,
+            style: const TextStyle(color: Colors.white),
+            decoration: const InputDecoration(
+              border: OutlineInputBorder(),
+              filled: true,
+              fillColor: Colors.white10,
+            ),
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(dialogCtx).pop(),
+            child: const Text('Cancel'),
+          ),
+          ElevatedButton(
+            onPressed: () => Navigator.of(dialogCtx).pop(ctrl.text.trim()),
+            style: ElevatedButton.styleFrom(backgroundColor: Colors.red),
+            child: const Text('Save'),
+          ),
+        ],
+      ),
+    );
+
+    final newText = result?.trim();
+    if (newText == null || newText.isEmpty || newText == c.content) return;
+
+    try {
+      final uri = Uri.parse('${AppConstants.baseApiUrl}/api/Comment/UpdateComment');
+      final headers = _authHeaders();
+      headers['Content-Type'] = 'application/json';
+
+      final res = await _httpClient.put(
+        uri,
+        headers: headers,
+        body: jsonEncode({
+          'commentID': c.commentID,
+          'movieID': c.movieID,
+          'userID': c.userID,
+          'parentID': c.parentID,
+          'content': newText,
+          'likeCount': c.likeCount ?? 0,
+        }),
+      );
+
+      if (res.statusCode == 401) {
+        await showAuthzPromptDialog(
+          context,
+          type: AuthzPromptType.signIn,
+          onPrimary: () => context.go('/signin'),
+        );
+        return;
+      }
+      if (res.statusCode == 403) {
+        await showAuthzPromptDialog(
+          context,
+          type: AuthzPromptType.buyPlan,
+          onPrimary: () => context.go('/profile'),
+        );
+        return;
+      }
+      if (res.statusCode < 200 || res.statusCode >= 300) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Failed to update comment (HTTP ${res.statusCode})')),
+        );
+        return;
+      }
+
+      await _loadComments();
+    } catch (e) {
+      ScaffoldMessenger.of(context)
+          .showSnackBar(SnackBar(content: Text('Network error: $e')));
+    }
+  }
+
+  Future<void> _deleteComment(CommentDemo c) async {
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (dialogCtx) => AlertDialog(
+        backgroundColor: Colors.grey[900],
+        title: const Text('Delete comment', style: TextStyle(color: Colors.white)),
+        content: const Text(
+          'Are you sure you want to delete this comment?',
+          style: TextStyle(color: Colors.white70),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(dialogCtx).pop(false),
+            child: const Text('Cancel'),
+          ),
+          ElevatedButton(
+            onPressed: () => Navigator.of(dialogCtx).pop(true),
+            style: ElevatedButton.styleFrom(backgroundColor: Colors.red),
+            child: const Text('Delete'),
+          ),
+        ],
+      ),
+    );
+    if (ok != true) return;
+
+    try {
+      final uri = Uri.parse('${AppConstants.baseApiUrl}/api/Comment/DeleteComment/${c.commentID}');
+      final res = await _httpClient.delete(uri, headers: _authHeaders());
+
+      if (res.statusCode == 401) {
+        await showAuthzPromptDialog(
+          context,
+          type: AuthzPromptType.signIn,
+          onPrimary: () => context.go('/signin'),
+        );
+        return;
+      }
+      if (res.statusCode == 403) {
+        await showAuthzPromptDialog(
+          context,
+          type: AuthzPromptType.buyPlan,
+          onPrimary: () => context.go('/profile'),
+        );
+        return;
+      }
+      if (res.statusCode < 200 || res.statusCode >= 300) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Failed to delete comment (HTTP ${res.statusCode})')),
+        );
+        return;
+      }
+
+      await _loadComments();
+    } catch (e) {
+      ScaffoldMessenger.of(context)
+          .showSnackBar(SnackBar(content: Text('Network error: $e')));
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     return Column(
@@ -4612,6 +4757,45 @@ class _CommentsDemoWidgetState extends State<CommentsDemoWidget> {
                         Text(_formatDate(c.createdAt),
                             style: const TextStyle(
                                 color: Colors.white54, fontSize: 12)),
+                        const Spacer(),
+                        if (isMe)
+                          PopupMenuButton<String>(
+                            tooltip: 'More',
+                            color: Colors.black87,
+                            icon: const Icon(Icons.more_vert, color: Colors.white70, size: 18),
+                            onSelected: (value) {
+                              switch (value) {
+                                case 'edit':
+                                  _editComment(c);
+                                  break;
+                                case 'delete':
+                                  _deleteComment(c);
+                                  break;
+                              }
+                            },
+                            itemBuilder: (ctx) => const [
+                              PopupMenuItem(
+                                value: 'edit',
+                                child: Row(
+                                  children: [
+                                    Icon(Icons.edit, color: Colors.white70, size: 18),
+                                    SizedBox(width: 8),
+                                    Text('Edit', style: TextStyle(color: Colors.white)),
+                                  ],
+                                ),
+                              ),
+                              PopupMenuItem(
+                                value: 'delete',
+                                child: Row(
+                                  children: [
+                                    Icon(Icons.delete, color: Colors.red, size: 18),
+                                    SizedBox(width: 8),
+                                    Text('Delete', style: TextStyle(color: Colors.red)),
+                                  ],
+                                ),
+                              ),
+                            ],
+                          ),
                       ],
                     ),
                     const SizedBox(height: 4),
@@ -4722,6 +4906,45 @@ class _CommentsDemoWidgetState extends State<CommentsDemoWidget> {
                         Text(_formatDate(r.createdAt),
                             style: const TextStyle(
                                 color: Colors.white54, fontSize: 12)),
+                        const Spacer(),
+                        if (isMe)
+                          PopupMenuButton<String>(
+                            tooltip: 'More',
+                            color: Colors.black87,
+                            icon: const Icon(Icons.more_vert, color: Colors.white70, size: 16),
+                            onSelected: (value) {
+                              switch (value) {
+                                case 'edit':
+                                  _editComment(r);
+                                  break;
+                                case 'delete':
+                                  _deleteComment(r);
+                                  break;
+                              }
+                            },
+                            itemBuilder: (ctx) => const [
+                              PopupMenuItem(
+                                value: 'edit',
+                                child: Row(
+                                  children: [
+                                    Icon(Icons.edit, color: Colors.white70, size: 18),
+                                    SizedBox(width: 8),
+                                    Text('Edit', style: TextStyle(color: Colors.white)),
+                                  ],
+                                ),
+                              ),
+                              PopupMenuItem(
+                                value: 'delete',
+                                child: Row(
+                                  children: [
+                                    Icon(Icons.delete, color: Colors.red, size: 18),
+                                    SizedBox(width: 8),
+                                    Text('Delete', style: TextStyle(color: Colors.red)),
+                                  ],
+                                ),
+                              ),
+                            ],
+                          ),
                       ],
                     ),
                     const SizedBox(height: 4),
@@ -5477,92 +5700,6 @@ class ProfileScreen extends StatelessWidget {
     );
   }
 
-  void _confirmDeleteAccount(BuildContext context) {
-    final info = currentUserInfo.value;
-    final userId = int.tryParse(info?['userID'] ?? '');
-    if (userId == null || userId <= 0) {
-      ScaffoldMessenger.of(context)
-          .showSnackBar(const SnackBar(content: Text('Please sign in again.')));
-      return;
-    }
-
-    bool deleting = false;
-    String? error;
-    final userService = UserService();
-
-    showDialog(
-      context: context,
-      builder: (dialogCtx) => StatefulBuilder(
-        builder: (dialogCtx, setState) {
-          return AlertDialog(
-            backgroundColor: Colors.grey[900],
-            title: const Text('Delete account', style: TextStyle(color: Colors.white)),
-            content: Column(
-              mainAxisSize: MainAxisSize.min,
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                const Text('This action cannot be undone.',
-                    style: TextStyle(color: Colors.white70)),
-                const SizedBox(height: 8),
-                Text('User: ${info?['userName'] ?? ''}',
-                    style: const TextStyle(color: Colors.white70)),
-                if (error != null) ...[
-                  const SizedBox(height: 8),
-                  Text(error!, style: const TextStyle(color: Colors.red)),
-                ],
-              ],
-            ),
-            actions: [
-              TextButton(
-                onPressed: deleting ? null : () => Navigator.of(dialogCtx).pop(),
-                child: const Text('Cancel'),
-              ),
-              ElevatedButton(
-                onPressed: deleting
-                    ? null
-                    : () async {
-                        setState(() {
-                          deleting = true;
-                          error = null;
-                        });
-                        try {
-                          await userService.deleteAccount(userId: userId);
-                          Navigator.of(dialogCtx).pop();
-                          try {
-                            await AuthService().signOut();
-                          } catch (_) {}
-                          await StorageService.clearUser();
-                          isLoggedIn.value = false;
-                          currentUserInfo.value = null;
-                          unawaited(refreshSavedMoviesForCurrentUser());
-                          if (context.mounted) {
-                            ScaffoldMessenger.of(context).showSnackBar(
-                                const SnackBar(content: Text('Account deleted')));
-                            context.go('/');
-                          }
-                        } catch (e) {
-                          setState(() {
-                            error = e.toString();
-                            deleting = false;
-                          });
-                        }
-                      },
-                style: ElevatedButton.styleFrom(backgroundColor: Colors.red),
-                child: deleting
-                    ? const SizedBox(
-                        width: 18,
-                        height: 18,
-                        child: CircularProgressIndicator(strokeWidth: 2),
-                      )
-                    : const Text('Delete Account'),
-              ),
-            ],
-          );
-        },
-      ),
-    );
-  }
-
   @override
   Widget build(BuildContext context) {
     return DefaultTabController(
@@ -5596,12 +5733,23 @@ class ProfileScreen extends StatelessWidget {
           valueListenable: currentUserInfo,
           builder: (context, info, _) {
             final name = info?['userName'] ?? 'Guest';
-            final email = info?['email'] ?? 'Not signed in';
             final gender = info?['gender'] ?? '—';
             final avatarUrl = cacheBustUrl(
               resolveApiUrl(info?['avatar']),
               cacheKey: avatarCacheBuster.value,
             );
+
+            String dash(String? v) {
+              final s = (v ?? '').trim();
+              return s.isEmpty ? '—' : s;
+            }
+
+            String formatDob(String? raw) {
+              final dt = DateTime.tryParse((raw ?? '').trim());
+              if (dt == null) return '—';
+              return DateFormat('dd/MM/yyyy').format(dt.toLocal());
+            }
+
             return TabBarView(
               children: [
                 // Overview
@@ -5615,48 +5763,118 @@ class ProfileScreen extends StatelessWidget {
                           color: Colors.grey[900],
                           child: Padding(
                             padding: const EdgeInsets.all(20),
-                            child: Row(
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
                               children: [
-                                CircleAvatar(
-                                  radius: 36,
-                                  backgroundColor: Colors.red,
-                                  backgroundImage:
-                                    avatarUrl.isNotEmpty ? NetworkImage(avatarUrl) : null,
-                                  child: avatarUrl.isNotEmpty
-                                    ? null
-                                    : Text(
-                                      name.isNotEmpty
-                                        ? name[0].toUpperCase()
-                                        : 'U',
-                                      style: const TextStyle(
-                                        color: Colors.white,
-                                        fontSize: 20,
-                                        fontWeight: FontWeight.bold),
+                                Row(
+                                  children: [
+                                    CircleAvatar(
+                                      radius: 28,
+                                      backgroundColor: Colors.red,
+                                      backgroundImage:
+                                          avatarUrl.isNotEmpty ? NetworkImage(avatarUrl) : null,
+                                      child: avatarUrl.isNotEmpty
+                                          ? null
+                                          : Text(
+                                              (name.isNotEmpty ? name[0] : 'U').toUpperCase(),
+                                              style: const TextStyle(
+                                                color: Colors.white,
+                                                fontSize: 18,
+                                                fontWeight: FontWeight.bold,
+                                              ),
+                                            ),
                                     ),
-                                ),
-                                const SizedBox(width: 16),
-                                Expanded(
-                                  child: Column(
-                                    crossAxisAlignment:
-                                        CrossAxisAlignment.start,
-                                    children: [
-                                      Text(name,
-                                          style: const TextStyle(
+                                    const SizedBox(width: 16),
+                                    Expanded(
+                                      child: Column(
+                                        crossAxisAlignment: CrossAxisAlignment.start,
+                                        children: [
+                                          const Text('Username',
+                                              style: TextStyle(color: Colors.white70)),
+                                          const SizedBox(height: 6),
+                                          Text(
+                                            dash(info?['userName']),
+                                            style: const TextStyle(
                                               color: Colors.white,
-                                              fontSize: 24,
-                                              fontWeight: FontWeight.w700)),
-                                      const SizedBox(height: 4),
-                                      Text(email,
-                                          style: const TextStyle(
-                                              color: Colors.white70)),
-                                    ],
+                                              fontSize: 18,
+                                              fontWeight: FontWeight.w600,
+                                            ),
+                                          ),
+                                        ],
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                                const SizedBox(height: 16),
+                                Row(
+                                  children: [
+                                    Expanded(
+                                      child: Column(
+                                        crossAxisAlignment: CrossAxisAlignment.start,
+                                        children: [
+                                          const Text('First name',
+                                              style: TextStyle(color: Colors.white70)),
+                                          const SizedBox(height: 6),
+                                          Text(
+                                            dash(info?['firstName']),
+                                            style: const TextStyle(
+                                              color: Colors.white,
+                                              fontSize: 18,
+                                              fontWeight: FontWeight.w600,
+                                            ),
+                                          ),
+                                        ],
+                                      ),
+                                    ),
+                                    const SizedBox(width: 12),
+                                    Expanded(
+                                      child: Column(
+                                        crossAxisAlignment: CrossAxisAlignment.start,
+                                        children: [
+                                          const Text('Last name',
+                                              style: TextStyle(color: Colors.white70)),
+                                          const SizedBox(height: 6),
+                                          Text(
+                                            dash(info?['lastName']),
+                                            style: const TextStyle(
+                                              color: Colors.white,
+                                              fontSize: 18,
+                                              fontWeight: FontWeight.w600,
+                                            ),
+                                          ),
+                                        ],
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                                const SizedBox(height: 16),
+                                const Text('Gender',
+                                    style: TextStyle(color: Colors.white70)),
+                                const SizedBox(height: 6),
+                                Text(
+                                  dash(gender),
+                                  style: const TextStyle(
+                                    color: Colors.white,
+                                    fontSize: 18,
+                                    fontWeight: FontWeight.w600,
+                                  ),
+                                ),
+                                const SizedBox(height: 16),
+                                const Text('Date of birth',
+                                    style: TextStyle(color: Colors.white70)),
+                                const SizedBox(height: 6),
+                                Text(
+                                  formatDob(info?['dateOfBirth']),
+                                  style: const TextStyle(
+                                    color: Colors.white,
+                                    fontSize: 18,
+                                    fontWeight: FontWeight.w600,
                                   ),
                                 ),
                               ],
                             ),
                           ),
                         ),
-                        const SizedBox(height: 16),
                         const SizedBox(height: 16),
                         Card(
                           color: Colors.grey[900],
@@ -5680,46 +5898,6 @@ class ProfileScreen extends StatelessWidget {
                       children: [
                         _InlineProfileEditorCard(
                           key: ValueKey(info?['userID'] ?? 'guest'),
-                        ),
-                        const SizedBox(height: 12),
-                        Card(
-                          elevation: 0,
-                          child: const Padding(
-                            padding: EdgeInsets.all(16),
-                            child: Column(
-                              crossAxisAlignment: CrossAxisAlignment.start,
-                              children: [
-                                Text('Preferences',
-                                    style:
-                                        TextStyle(fontWeight: FontWeight.w700)),
-                                SizedBox(height: 8),
-                                Text(
-                                    'Notification and theme preferences will be added later.'),
-                              ],
-                            ),
-                          ),
-                        ),
-                        const SizedBox(height: 12),
-                        Card(
-                          elevation: 0,
-                          child: Padding(
-                            padding: const EdgeInsets.all(16),
-                            child: Column(
-                              crossAxisAlignment: CrossAxisAlignment.start,
-                              children: [
-                                const Text('Danger Zone',
-                                    style:
-                                        TextStyle(fontWeight: FontWeight.w700)),
-                                const SizedBox(height: 8),
-                                OutlinedButton.icon(
-                                  onPressed: () => _confirmDeleteAccount(context),
-                                  icon: const Icon(Icons.delete_forever,
-                                      color: Colors.red),
-                                  label: const Text('Delete Account'),
-                                ),
-                              ],
-                            ),
-                          ),
                         ),
                       ],
                     ),

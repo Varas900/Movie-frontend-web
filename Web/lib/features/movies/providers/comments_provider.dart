@@ -173,6 +173,34 @@ class CommentsRepository {
     if (res.statusCode == 403) throw Exception('HTTP_403');
     return res.statusCode >= 200 && res.statusCode < 300;
   }
+
+  Future<bool> updateComment({
+    required Comment comment,
+    required String content,
+  }) async {
+    final uri = Uri.parse('${AppConstants.baseApiUrl}/api/Comment/UpdateComment');
+    final body = jsonEncode({
+      'commentID': comment.commentID,
+      'movieID': comment.movieID,
+      'userID': comment.userID,
+      'parentID': comment.parentID,
+      'content': content,
+      'likeCount': comment.likeCount ?? 0,
+    });
+
+    final res = await _client.put(uri, headers: _authHeaders(), body: body);
+    if (res.statusCode == 401) throw Exception('HTTP_401');
+    if (res.statusCode == 403) throw Exception('HTTP_403');
+    return res.statusCode >= 200 && res.statusCode < 300;
+  }
+
+  Future<bool> deleteComment({required int commentId}) async {
+    final uri = Uri.parse('${AppConstants.baseApiUrl}/api/Comment/DeleteComment/$commentId');
+    final res = await _client.delete(uri, headers: _authHeaders(includeJson: false));
+    if (res.statusCode == 401) throw Exception('HTTP_401');
+    if (res.statusCode == 403) throw Exception('HTTP_403');
+    return res.statusCode >= 200 && res.statusCode < 300;
+  }
 }
 
 final commentsRepositoryProvider = Provider<CommentsRepository>((ref) => CommentsRepository());
