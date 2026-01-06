@@ -3,6 +3,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../models/user_model.dart';
 import '../services/storage_service.dart';
 import '../services/auth_service.dart';
+import '../services/user_service.dart';
 
 // Authentication State
 class AuthState {
@@ -56,6 +57,53 @@ class AuthNotifier extends StateNotifier<AuthState> {
         isAuthenticated: true,
         permissions: permissions,
       );
+      return;
+    }
+
+    // Web Google OAuth flow is cookie-based; token may not be stored locally.
+    // Try to refresh via cookie + CSRF to obtain an access token + permissions,
+    // then hydrate the current user via /user/me.
+    try {
+      final refreshRes = await _authService.refreshToken();
+      if (refreshRes['success'] == true) {
+        final dynamic outer = refreshRes['data'] ?? refreshRes;
+        final dynamic inner = (outer is Map<String, dynamic>)
+            ? (outer['data'] ?? outer['Data'] ?? outer)
+            : outer;
+
+        String? accessToken;
+        final parsedPerms = <String>{};
+        if (inner is Map<String, dynamic>) {
+          accessToken = inner['accessToken'] as String?;
+          final rawPerms = inner['permissions'];
+          if (rawPerms is List) {
+            for (final p in rawPerms) {
+              final s = p?.toString().trim() ?? '';
+              if (s.isNotEmpty) parsedPerms.add(s);
+            }
+          }
+        }
+
+        if (accessToken != null && accessToken.trim().isNotEmpty) {
+          StorageService.saveUserToken(accessToken.trim());
+        }
+        if (parsedPerms.isNotEmpty) {
+          StorageService.savePermissions(parsedPerms);
+        }
+
+        final me = await UserService().getMe();
+        final hydratedUser = User.fromJson(me);
+        StorageService.saveUser(hydratedUser);
+
+        state = AuthState(
+          user: hydratedUser,
+          isAuthenticated: true,
+          permissions: parsedPerms.isEmpty ? StorageService.getPermissions() : parsedPerms,
+        );
+        return;
+      }
+    } catch (_) {
+      // Ignore: no cookie session or refresh failed.
     }
   }
 

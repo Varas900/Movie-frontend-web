@@ -611,7 +611,21 @@ class _ProfileSubscriptionState extends ConsumerState<_ProfileSubscription> {
       final auth = ref.read(authProvider);
       final userId = auth.user?.userId;
       if (userId != null && userId > 0) {
-        final subsRes = await http.get(Uri.parse('${AppConstants.baseApiUrl}/api/payment/subscription/user/$userId'));
+        final subsUri = Uri.parse('${AppConstants.baseApiUrl}/api/payment/subscription/user/$userId');
+        final client = createHttpClient(withCredentials: true);
+        http.Response subsRes;
+        try {
+          final token = StorageService.getUserToken();
+          subsRes = await client.get(
+            subsUri,
+            headers: {
+              'Accept': 'application/json',
+              if (token != null && token.trim().isNotEmpty) 'Authorization': 'Bearer ${token.trim()}',
+            },
+          );
+        } finally {
+          client.close();
+        }
         if (subsRes.statusCode >= 200 && subsRes.statusCode < 300) {
           final body = json.decode(subsRes.body);
           final arr = (body is Map<String, dynamic>)

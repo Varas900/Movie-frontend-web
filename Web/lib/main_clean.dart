@@ -2834,7 +2834,7 @@ class _UserRatingSectionDemoState extends State<_UserRatingSectionDemo> {
       // Subscription
       bool hasPlan = false;
       try {
-        final subsRes = await http.get(
+        final subsRes = await _httpClient.get(
           Uri.parse(
               '${AppConstants.baseApiUrl}/api/payment/subscription/user/$userId'),
           headers: _authHeaders(),
@@ -6627,7 +6627,7 @@ class _SubscriptionSectionDemoState extends State<_SubscriptionSectionDemo> {
       final userIdStr = info?['userID'] ?? info?['userId'];
       final userId = int.tryParse(userIdStr ?? '');
       if (userId != null && userId > 0) {
-        final subsRes = await http.get(
+        final subsRes = await _httpClient.get(
           Uri.parse(
               '${AppConstants.baseApiUrl}/api/payment/subscription/user/$userId'),
           headers: authHeaders,
@@ -6649,7 +6649,7 @@ class _SubscriptionSectionDemoState extends State<_SubscriptionSectionDemo> {
             var planId = latest['planID'] ?? latest['planId'];
             if (planId == null && latest['priceID'] != null) {
               try {
-                final priceRes = await http.get(
+                final priceRes = await _httpClient.get(
                   Uri.parse(
                       '${AppConstants.baseApiUrl}/api/price/${latest['priceID']}'),
                   headers: authHeaders,

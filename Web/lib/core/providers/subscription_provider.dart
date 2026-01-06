@@ -5,6 +5,8 @@ import 'package:http/http.dart' as http;
 
 import '../utils/app_constants.dart';
 import 'auth_provider.dart';
+import '../services/storage_service.dart';
+import '../services/http_client_factory.dart';
 
 bool _isActiveSubscriptionRecord(Map<String, dynamic> sub) {
   final status = (sub['status'] ?? 'active').toString().toLowerCase().trim();
@@ -26,7 +28,20 @@ final hasActiveSubscriptionProvider = FutureProvider<bool>((ref) async {
   if (userId == null || userId <= 0) return false;
 
   final uri = Uri.parse('${AppConstants.baseApiUrl}/api/payment/subscription/user/$userId');
-  final res = await http.get(uri);
+  final client = createHttpClient(withCredentials: true);
+  http.Response res;
+  try {
+    final token = StorageService.getUserToken();
+    res = await client.get(
+      uri,
+      headers: {
+        'Accept': 'application/json',
+        if (token != null && token.trim().isNotEmpty) 'Authorization': 'Bearer ${token.trim()}',
+      },
+    );
+  } finally {
+    client.close();
+  }
   if (res.statusCode < 200 || res.statusCode >= 300) return false;
 
   final body = jsonDecode(res.body);

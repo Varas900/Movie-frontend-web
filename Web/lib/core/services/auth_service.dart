@@ -7,6 +7,21 @@ import '../utils/app_constants.dart';
 class AuthService {
   final String _baseUrl = AppConstants.baseApiUrl;
 
+  String? _readCookie(String name) {
+    final raw = html.document.cookie ?? '';
+    if (raw.isEmpty) return null;
+    for (final part in raw.split(';')) {
+      final kv = part.trim();
+      if (kv.isEmpty) continue;
+      final eq = kv.indexOf('=');
+      if (eq <= 0) continue;
+      final k = kv.substring(0, eq).trim();
+      if (k != name) continue;
+      return Uri.decodeComponent(kv.substring(eq + 1));
+    }
+    return null;
+  }
+
   Future<Map<String, dynamic>> _postJson(
       String url, Map<String, dynamic> body) async {
     try {
@@ -322,14 +337,37 @@ class AuthService {
 
   Future<Map<String, dynamic>> refreshToken() async {
     try {
-      final response = await http.post(
-        Uri.parse('$_baseUrl/auth/refresh'),
-        headers: {
+      // Web cookie flow: backend endpoint is /login/auth/refresh and requires
+      // X-CSRF header matching fz.csrf cookie.
+      final csrf = _readCookie('fz.csrf');
+      final url = Uri.parse('$_baseUrl/login/auth/refresh');
+
+      final req = await html.HttpRequest.request(
+        url.toString(),
+        method: 'POST',
+        withCredentials: true,
+        requestHeaders: {
           'Content-Type': 'application/json',
+          'Accept': 'application/json',
+          if (csrf != null && csrf.isNotEmpty) 'X-CSRF': csrf,
         },
+        sendData: jsonEncode(<String, dynamic>{}),
       );
 
-      return jsonDecode(response.body);
+      final bodyText = req.responseText ?? '';
+      final ok = (req.status ?? 0) >= 200 && (req.status ?? 0) < 300;
+      final decoded = bodyText.isEmpty ? null : _safeDecode(bodyText);
+      if (ok) {
+        return {
+          'success': true,
+          'data': decoded ?? <String, dynamic>{},
+        };
+      }
+      return {
+        'success': false,
+        'message': _extractMessage(decoded, 'Token refresh failed'),
+        'data': decoded,
+      };
     } catch (e) {
       return {
         'success': false,
