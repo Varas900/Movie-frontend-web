@@ -1,11 +1,10 @@
 import 'dart:convert';
-import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:http/http.dart' as http;
-import 'package:http/browser_client.dart';
 
 import '../../../core/models/comment_model.dart';
 import '../../../core/utils/app_constants.dart';
+import '../../../core/services/http_client_factory.dart';
 import '../../../core/providers/auth_provider.dart';
 import '../../../core/services/storage_service.dart';
 
@@ -123,10 +122,7 @@ class CommentsRepository {
   CommentsRepository({http.Client? client}) : _client = client ?? _defaultClient();
 
   static http.Client _defaultClient() {
-    if (kIsWeb) {
-      return BrowserClient()..withCredentials = true;
-    }
-    return http.Client();
+    return createHttpClient(withCredentials: true);
   }
 
   Map<String, String> _authHeaders({bool includeJson = true}) {

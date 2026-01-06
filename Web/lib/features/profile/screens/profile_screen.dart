@@ -13,6 +13,7 @@ import '../../../core/routing/app_router.dart';
 import '../../../core/utils/app_constants.dart';
 import '../../../core/utils/url_utils.dart';
 import '../../../core/services/storage_service.dart';
+import '../../../core/services/http_client_factory.dart';
 import '../../../core/services/user_service.dart';
 
 class ProfileScreen extends ConsumerWidget {
@@ -709,17 +710,23 @@ class _ProfileSubscriptionState extends ConsumerState<_ProfileSubscription> {
         return;
       }
       final uri = Uri.parse('${AppConstants.baseApiUrl}/api/payment/vnpay/checkout');
-      final res = await http.post(
-        uri,
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': 'Bearer $token',
-        },
-        body: json.encode({
-          'PriceId': priceId,
-          'AutoRenew': false,
-        }),
-      );
+      final client = createHttpClient(withCredentials: true);
+      http.Response res;
+      try {
+        res = await client.post(
+          uri,
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': 'Bearer $token',
+          },
+          body: json.encode({
+            'PriceId': priceId,
+            'AutoRenew': false,
+          }),
+        );
+      } finally {
+        client.close();
+      }
       if (res.statusCode < 200 || res.statusCode >= 300) {
         throw Exception('Checkout failed (${res.statusCode})');
       }

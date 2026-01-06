@@ -20,6 +20,7 @@ import 'package:intl/intl.dart';
 import 'package:flixgo_web/features/player/widgets/youtube_embed_player.dart';
 import 'package:flixgo_web/core/utils/url_utils.dart';
 import 'package:flixgo_web/core/utils/authz_prompt.dart';
+import 'package:flixgo_web/core/services/permission_guard_client.dart';
 
 // Simple global auth flag. In a real app, replace with Provider/Bloc.
 final ValueNotifier<bool> isLoggedIn = ValueNotifier<bool>(false);
@@ -257,7 +258,8 @@ Future<void> main() async {
   runApp(const FlixGoApp());
 }
 
-final BrowserClient _httpClient = BrowserClient()..withCredentials = true;
+final http.Client _httpClient =
+  PermissionGuardClient(BrowserClient()..withCredentials = true);
 
 Map<String, String> _authHeaders() {
   final headers = <String, String>{
@@ -2966,7 +2968,7 @@ class _UserRatingSectionDemoState extends State<_UserRatingSectionDemo> {
     try {
       http.Response res;
       if ((_myUserRatingId ?? 0) > 0) {
-        res = await http.put(
+        res = await _httpClient.put(
           Uri.parse(
               '${AppConstants.baseApiUrl}/api/UserRating/UpdateUserRating'),
           headers: _authHeaders(),
@@ -2978,7 +2980,7 @@ class _UserRatingSectionDemoState extends State<_UserRatingSectionDemo> {
           }),
         );
       } else {
-        res = await http.post(
+        res = await _httpClient.post(
           Uri.parse(
               '${AppConstants.baseApiUrl}/api/UserRating/CreateUserRating'),
           headers: _authHeaders(),
@@ -6771,7 +6773,7 @@ class _SubscriptionSectionDemoState extends State<_SubscriptionSectionDemo> {
       }
       final uri =
           Uri.parse('${AppConstants.baseApiUrl}/api/payment/vnpay/checkout');
-      final res = await http.post(
+      final res = await _httpClient.post(
         uri,
         headers: {
           'Content-Type': 'application/json',

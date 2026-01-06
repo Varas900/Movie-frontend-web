@@ -1,10 +1,9 @@
 import 'dart:convert';
 
-import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:http/http.dart' as http;
-import 'package:http/browser_client.dart';
 
 import '../models/saved_movie_model.dart';
+import '../services/http_client_factory.dart';
 import '../services/storage_service.dart';
 import '../utils/app_constants.dart';
 
@@ -14,10 +13,8 @@ class SavedMovieService {
   SavedMovieService({http.Client? client}) : _client = client ?? _defaultClient();
 
   static http.Client _defaultClient() {
-    if (kIsWeb) {
-      return BrowserClient()..withCredentials = true;
-    }
-    return http.Client();
+    // Keep withCredentials for cookie-based auth, and wrap with permission guard.
+    return createHttpClient(withCredentials: true);
   }
 
   Map<String, String> _authHeaders() {

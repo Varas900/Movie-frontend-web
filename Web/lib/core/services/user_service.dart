@@ -1,11 +1,10 @@
 import 'dart:convert';
 
-import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:http/http.dart' as http;
-import 'package:http/browser_client.dart';
 import 'package:image_picker/image_picker.dart';
 
 import 'storage_service.dart';
+import '../services/http_client_factory.dart';
 import '../utils/app_constants.dart';
 
 class UserService {
@@ -14,10 +13,7 @@ class UserService {
   UserService({http.Client? client}) : _client = client ?? _defaultClient();
 
   static http.Client _defaultClient() {
-    if (kIsWeb) {
-      return BrowserClient()..withCredentials = true;
-    }
-    return http.Client();
+    return createHttpClient(withCredentials: true);
   }
 
   Map<String, String> _authHeaders({bool includeJson = true}) {

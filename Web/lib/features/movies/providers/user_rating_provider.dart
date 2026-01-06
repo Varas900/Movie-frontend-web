@@ -7,8 +7,13 @@ import '../../../core/models/user_rating_model.dart';
 import '../../../core/services/storage_service.dart';
 import '../../../core/utils/app_constants.dart';
 import '../../../core/providers/auth_provider.dart';
+import '../../../core/services/http_client_factory.dart';
 
 class UserRatingRepository {
+  final http.Client _client;
+
+  UserRatingRepository({http.Client? client}) : _client = client ?? createHttpClient(withCredentials: true);
+
   Map<String, String> _authHeaders() {
     final token = StorageService.getUserToken();
     final headers = <String, String>{
@@ -86,7 +91,7 @@ class UserRatingRepository {
 
     if (userRatingId != null && userRatingId > 0) {
       final uri = Uri.parse('${AppConstants.baseApiUrl}/api/UserRating/UpdateUserRating');
-      final res = await http.put(
+      final res = await _client.put(
         uri,
         headers: _authHeaders(),
         body: jsonEncode({
@@ -105,7 +110,7 @@ class UserRatingRepository {
     }
 
     final uri = Uri.parse('${AppConstants.baseApiUrl}/api/UserRating/CreateUserRating');
-    final res = await http.post(
+    final res = await _client.post(
       uri,
       headers: _authHeaders(),
       body: jsonEncode({
