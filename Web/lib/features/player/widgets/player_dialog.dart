@@ -5,6 +5,7 @@ import 'package:chewie/chewie.dart';
 import 'package:video_player/video_player.dart';
 import '../../../core/utils/app_constants.dart';
 import '../../../core/services/storage_service.dart';
+import '../../../core/services/http_client_factory.dart';
 import '../../../core/utils/authz_prompt.dart';
 import 'youtube_embed_player.dart';
 
@@ -64,14 +65,6 @@ class _PlayerDialogState extends State<PlayerDialog>
       _sources = [];
     });
     try {
-      final token = StorageService.getUserToken();
-      if (token == null || token.trim().isEmpty) {
-        setState(() {
-          _error = 'Please sign in to continue.';
-          _isLoading = false;
-        });
-        return;
-      }
       final primary = await _fetchPublicSources(widget.movieId);
       if (primary.isNotEmpty) {
         _sources = primary;
@@ -104,7 +97,13 @@ class _PlayerDialogState extends State<PlayerDialog>
       headers['Authorization'] = 'Bearer ${token.trim()}';
     }
 
-    final res = await http.get(url, headers: headers);
+    final client = HttpClientFactory.create();
+    late final http.Response res;
+    try {
+      res = await client.get(url, headers: headers);
+    } finally {
+      client.close();
+    }
 
     if (res.statusCode == 401) {
       throw Exception('HTTP_401');

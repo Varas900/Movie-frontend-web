@@ -7,6 +7,7 @@ import 'package:video_player/video_player.dart';
 import 'package:chewie/chewie.dart';
 import '../../../core/utils/app_constants.dart';
 import '../../../core/services/storage_service.dart';
+import '../../../core/services/http_client_factory.dart';
 import '../../../core/utils/authz_prompt.dart';
 import '../widgets/youtube_embed_player.dart';
 // Chewie exports Subtitle/Subtitles via its main import
@@ -80,15 +81,6 @@ class _PlayerScreenState extends State<PlayerScreen> {
       _error = null;
       _sources = [];
     });
-
-    final token = StorageService.getUserToken();
-    if (token == null || token.trim().isEmpty) {
-      setState(() {
-        _error = 'Please sign in to continue.';
-        _isLoading = false;
-      });
-      return;
-    }
 
     try {
       // If episode provided (series), try episode source first
@@ -202,12 +194,17 @@ class _PlayerScreenState extends State<PlayerScreen> {
       'Accept': 'application/json',
     };
     final token = StorageService.getUserToken();
-    if (token == null || token.trim().isEmpty) {
-      throw Exception('HTTP_401');
+    if (token != null && token.trim().isNotEmpty) {
+      headers['Authorization'] = 'Bearer ${token.trim()}';
     }
-    headers['Authorization'] = 'Bearer ${token.trim()}';
 
-    final res = await http.get(url, headers: headers);
+    final client = HttpClientFactory.create();
+    late final http.Response res;
+    try {
+      res = await client.get(url, headers: headers);
+    } finally {
+      client.close();
+    }
     if (res.statusCode == 401) {
       throw Exception('HTTP_401');
     }
@@ -252,12 +249,17 @@ class _PlayerScreenState extends State<PlayerScreen> {
       'Accept': 'application/json',
     };
     final token = StorageService.getUserToken();
-    if (token == null || token.trim().isEmpty) {
-      throw Exception('HTTP_401');
+    if (token != null && token.trim().isNotEmpty) {
+      headers['Authorization'] = 'Bearer ${token.trim()}';
     }
-    headers['Authorization'] = 'Bearer ${token.trim()}';
 
-    final res = await http.get(url, headers: headers);
+    final client = HttpClientFactory.create();
+    late final http.Response res;
+    try {
+      res = await client.get(url, headers: headers);
+    } finally {
+      client.close();
+    }
     if (res.statusCode == 401) {
       throw Exception('HTTP_401');
     }

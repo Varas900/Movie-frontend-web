@@ -3177,14 +3177,6 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
     });
 
     final token = StorageService.getUserToken();
-    if (token == null || token.trim().isEmpty) {
-      setState(() {
-        _error = 'Please sign in to continue.';
-        _isLoading = false;
-      });
-      return;
-    }
-
     try {
       // Primary: public movie sources by movieId
       final movieSources = await _fetchMovieSources(widget.movie.id);
@@ -3248,12 +3240,11 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
       'Accept': 'application/json',
     };
     final token = StorageService.getUserToken();
-    if (token == null || token.trim().isEmpty) {
-      throw Exception('HTTP_401');
+    if (token != null && token.trim().isNotEmpty) {
+      headers['Authorization'] = 'Bearer ${token.trim()}';
     }
-    headers['Authorization'] = 'Bearer ${token.trim()}';
 
-    final res = await http.get(url, headers: headers);
+    final res = await _httpClient.get(url, headers: headers);
     if (res.statusCode == 401) {
       throw Exception('HTTP_401');
     }
@@ -3674,12 +3665,11 @@ class _InlinePlayerDialogDemoState extends State<InlinePlayerDialogDemo>
       'Accept': 'application/json',
     };
     final token = StorageService.getUserToken();
-    if (token == null || token.trim().isEmpty) {
-      throw Exception('HTTP_401');
+    if (token != null && token.trim().isNotEmpty) {
+      headers['Authorization'] = 'Bearer ${token.trim()}';
     }
-    headers['Authorization'] = 'Bearer ${token.trim()}';
 
-    final res = await http.get(uri, headers: headers);
+    final res = await _httpClient.get(uri, headers: headers);
     if (res.statusCode == 401) {
       throw Exception('HTTP_401');
     }
@@ -3715,12 +3705,11 @@ class _InlinePlayerDialogDemoState extends State<InlinePlayerDialogDemo>
       'Accept': 'application/json',
     };
     final token = StorageService.getUserToken();
-    if (token == null || token.trim().isEmpty) {
-      throw Exception('HTTP_401');
+    if (token != null && token.trim().isNotEmpty) {
+      headers['Authorization'] = 'Bearer ${token.trim()}';
     }
-    headers['Authorization'] = 'Bearer ${token.trim()}';
 
-    final res = await http.get(uri, headers: headers);
+    final res = await _httpClient.get(uri, headers: headers);
     if (res.statusCode == 401) {
       throw Exception('HTTP_401');
     }
