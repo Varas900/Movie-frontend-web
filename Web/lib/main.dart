@@ -1,3 +1,3 @@
 import 'main_clean.dart' as clean;
 
-void main() => clean.main();
+Future<void> main() => clean.main();

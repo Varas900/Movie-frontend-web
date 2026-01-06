@@ -196,10 +196,16 @@ Future<void> _ensureCurrentUserFromCookiesIfNeeded() async {
   if (currentUserInfo.value != null && isLoggedIn.value) return;
   try {
     final url = Uri.parse('${AppConstants.baseApiUrl}/user/me');
+    final token = StorageService.getUserToken();
     final req = await html.HttpRequest.request(
       url.toString(),
       method: 'GET',
       withCredentials: true,
+      requestHeaders: {
+        if (token != null && token.trim().isNotEmpty)
+          'Authorization': 'Bearer ${token.trim()}',
+        'Accept': 'application/json',
+      },
     );
     if (req.status == 200 && req.responseText != null) {
       final body = json.decode(req.responseText!);
@@ -242,7 +248,12 @@ Future<void> _ensureCurrentUserFromCookiesIfNeeded() async {
   }
 }
 
-void main() {
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  // After refresh, in-memory auth is lost. Restore persisted token first,
+  // then hydrate current user via /user/me (cookie or Authorization).
+  await StorageService.init();
+  await _ensureCurrentUserFromCookiesIfNeeded();
   runApp(const FlixGoApp());
 }
 
