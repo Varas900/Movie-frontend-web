@@ -1,7 +1,7 @@
 // Web-only YouTube embed using an <iframe>.
 
 import 'dart:html' as html;
-import 'dart:ui' as ui;
+import 'dart:ui_web' as ui_web;
 
 import 'package:flutter/material.dart';
 
@@ -57,8 +57,7 @@ class _YoutubeEmbedPlayerImplState extends State<YoutubeEmbedPlayerImpl> {
     if (embedUrl == null) return;
     _registered.add(_viewType);
 
-    // ignore: undefined_prefixed_name
-    ui.platformViewRegistry.registerViewFactory(_viewType, (int viewId) {
+    ui_web.platformViewRegistry.registerViewFactory(_viewType, (int viewId) {
       final uri = Uri.parse(embedUrl);
       final withParams = uri.replace(queryParameters: {
         ...uri.queryParameters,
