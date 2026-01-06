@@ -1,0 +1,127 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace FZ.Constant
+{
+    public static class PermissionConstants
+    {
+        public static readonly Dictionary<string, string> Permissions = new()
+        {
+            // --- Account & Auth ---
+            { "AccountMfaSetup", "account.mfa_setup" },
+            { "AccountChangePassword", "account.change_password" },
+            { "AuthForgotPassword", "auth.forgot_password" },
+            { "AuthLogout", "auth.logout" },
+            { "AuthRefresh", "auth.refresh" },
+            { "AuthLogin", "auth.login" },
+            { "AuthLoginGoogle", "auth.login_google" },
+            { "AuthMfaVerify", "auth.mfa_verify" },
+            { "AuthRegister", "auth.register" },
+
+            // --- User ---
+            { "UserDelete", "user.delete" },
+            { "UserReadProfile", "user.read_profile" },
+            { "UserUpdateProfile", "user.update_profile" },
+            { "UserReadDetails", "user.read_details" },
+            { "UserReadDetailsAdmin", "user.read_details.admin" },
+
+            // --- Role & Permission ---
+            { "RoleRead", "role.read" },
+            { "RoleManage", "role.manage" },
+            { "RoleManageAdmin", "role.manage.admin" },
+            { "RoleAssign", "role.assign" },
+            { "RoleAssignAdmin", "role.assign.admin" },
+            { "PermissionManage", "permission.manage" },
+            { "PermissionManageAdmin", "permission.manage.admin" },
+            { "PermissionRead", "permission.read" },
+            { "PermissionReadAdmin", "permission.read.admin" },
+            { "PermissionAssign", "permission.assign" },
+            { "PermissionAssignAdmin", "permission.assign.admin" },
+
+            { "AuditLogManage", "audit_log.manage" },
+            { "UserSessionManage", "usersession.manage" },
+
+            // --- Movie & Content ---
+            { "MovieReadDetails", "movie.read_details" },
+            { "MovieBrowse", "movie.browse" },
+            { "MovieWatchStream", "movie.watch_stream" },
+            { "MovieManage", "movie.manage" },
+            { "MovieWatchVip", "movie.watch_vip" },
+            { "SavedMovieManage", "saved_movie.manage" },
+            { "SavedMovieRead", "saved_movie.read" },
+
+            // --- Episode ---
+            { "EpisodeRead", "episode.read" },
+            { "EpisodeManage", "episode.manage" },
+
+            // --- Person (Actor/Director) ---
+            { "PersonRead", "person.read" },
+            { "PersonManage", "person.manage" },
+            { "MoviePersonRead", "movie_person.read" },
+            { "MoviePersonManage", "movie_person.manage" },
+
+            // --- Tags ---
+            { "TagRead", "tag.read" },
+            { "TagManage", "tag.manage" },
+            { "MovieTagRead", "movie_tag.read" },
+            { "MovieTagManage", "movie_tag.manage" },
+
+            // --- Subtitles ---
+            { "SubtitleRead", "subtitle.read" },
+            { "SubtitleCallback", "subtitle.callback" },
+            { "SubtitleUpload", "subtitle.upload" },
+            { "SubtitleTranslate", "subtitle.translate" },
+            { "SubtitleManage", "subtitle.manage" },
+
+            // --- Comment & Rating ---
+            { "CommentRead", "comment.read" },
+            { "CommentCreate", "comment.create" },
+            { "CommentUpdateOwn", "comment.update_own" },
+            { "CommentDeleteOwn", "comment.delete_own" },
+            { "RatingRead", "rating.read" },
+            { "RatingCreate", "rating.create" },
+            { "RatingUpdate", "rating.update" },
+            { "RatingDelete", "rating.delete" },
+
+            // --- Subscription & Payment ---
+            { "SubscriptionReadAll", "subscription.read_all" },
+            { "SubscriptionManage", "subscription.manage" },
+            { "SubscriptionReadOwn", "subscription.read_own" },
+            { "SubscriptionCancel", "subscription.cancel" },
+            { "OrderReadOwn", "order.read_own" },
+            { "OrderReadAll", "order.read_all" },
+            { "InvoiceReadOwn", "invoice.read_own" },
+            { "InvoiceReadAll", "invoice.read_all" },
+            { "PaymentCheckout", "payment.checkout" },
+            { "PaymentCallback", "payment.callback" },
+            { "PlanRead", "plan.read" },
+            { "PlanManage", "plan.manage" },
+            { "PriceRead", "price.read" },
+            { "PriceManage", "price.manage" },
+
+            // --- System & Upload ---
+            { "SystemHealth", "system.health" },
+            { "UploadArchive", "upload.archive" },
+            { "UploadVimeo", "upload.vimeo" },
+            { "UploadYoutube", "upload.youtube" },
+            { "ImageRead", "image.read" },
+            { "ImageManage", "image.manage" },
+            { "SourceRead", "source.read" },
+            { "SourceManage", "source.manage" },
+            { "RegionRead", "region.read" },
+            { "RegionManage", "region.manage" },
+
+            // --- Search & Progress ---
+            { "SearchManage", "search.manage" },
+            { "SearchMovie", "search.movie" },
+            { "SearchSuggest", "search.suggest" },
+            { "SearchPerson", "search.person" },
+            { "SearchAdvanced", "search.advanced" },
+            { "ProgressTrack", "progress.track" },
+            { "ProgressRead", "progress.read" }
+        };
+    }
+}

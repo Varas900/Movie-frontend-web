@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'dart:html' as html;
 import 'package:http/http.dart' as http;
 
 import '../utils/app_constants.dart';
@@ -6,31 +7,46 @@ import '../utils/app_constants.dart';
 class AuthService {
   final String _baseUrl = AppConstants.baseApiUrl;
 
-  Future<Map<String, dynamic>> signIn(String emailOrUsername, String password) async {
+  Future<Map<String, dynamic>> _postJson(
+      String url, Map<String, dynamic> body) async {
     try {
       final response = await http.post(
-        Uri.parse('$_baseUrl/login/userLogin'),
+        Uri.parse(url),
         headers: {
           'Content-Type': 'application/json',
+          'Accept': 'application/json',
         },
-        body: jsonEncode({
-          // Backend accepts email or username; map explicitly to userName
-          'userName': emailOrUsername,
-          'email': emailOrUsername,
-          'password': password,
-        }),
+        body: jsonEncode(body),
       );
 
-      if (response.statusCode == 200) {
-        final data = jsonDecode(response.body);
-        return {'success': true, 'data': data};
-      } else {
-        final errorData = _safeDecode(response.body);
+      if (response.body.isEmpty) {
         return {
-          'success': false,
-          'message': _extractMessage(errorData, 'Sign in failed'),
+          'success': response.statusCode >= 200 && response.statusCode < 300,
+          'errorCode': response.statusCode,
+          'message': response.statusCode >= 200 && response.statusCode < 300
+              ? 'Success'
+              : 'HTTP ${response.statusCode}: ${response.reasonPhrase}',
         };
       }
+
+      final decoded = _safeDecode(response.body);
+      if (decoded == null) {
+        return {
+          'success': false,
+          'errorCode': response.statusCode,
+          'message': 'Invalid response',
+        };
+      }
+
+      if (response.statusCode >= 200 && response.statusCode < 300) {
+        return decoded;
+      }
+
+      return {
+        ...decoded,
+        'success': false,
+        'message': _extractMessage(decoded, 'Request failed'),
+      };
     } catch (e) {
       return {
         'success': false,
@@ -39,21 +55,63 @@ class AuthService {
     }
   }
 
-  Future<Map<String, dynamic>> signUp(
-    String userName,
-    String firstName,
-    String lastName,
-    String email,
-    String password,
-    {String? gender}
-  ) async {
+  Future<Map<String, dynamic>> signIn(
+      String emailOrUsername, String password) async {
     try {
-      final response = await http.post(
-        Uri.parse('$_baseUrl/register'),
-        headers: {
+      // Important for web cookie-based sessions: include credentials so Set-Cookie
+      // is persisted by the browser and /user/me works after reload.
+      final url = Uri.parse('$_baseUrl/login/userLogin');
+      final req = await html.HttpRequest.request(
+        url.toString(),
+        method: 'POST',
+        withCredentials: true,
+        requestHeaders: {
           'Content-Type': 'application/json',
+          'Accept': 'application/json',
         },
-        body: jsonEncode({
+        sendData: jsonEncode({
+          // Backend accepts email or username; map explicitly to userName
+          'userName': emailOrUsername,
+          'email': emailOrUsername,
+          'password': password,
+        }),
+      );
+
+      final status = req.status ?? 0;
+      final bodyText = req.responseText ?? '';
+
+      if (status >= 200 && status < 300) {
+        final data = bodyText.isEmpty ? <String, dynamic>{} : jsonDecode(bodyText);
+        return {'success': true, 'data': data};
+      }
+
+      final errorData = bodyText.isEmpty ? null : _safeDecode(bodyText);
+      return {
+        'success': false,
+        'message': _extractMessage(errorData, 'Sign in failed'),
+      };
+    } catch (e) {
+      return {
+        'success': false,
+        'message': 'Network error: ${e.toString()}',
+      };
+    }
+  }
+
+  Future<Map<String, dynamic>> signUp(String userName, String firstName,
+      String lastName, String email, String password,
+      {String? gender}) async {
+    try {
+      final url = Uri.parse('$_baseUrl/register');
+      final req = await html.HttpRequest.request(
+        url.toString(),
+        method: 'POST',
+        withCredentials: true,
+        requestHeaders: {
+          'Content-Type': 'application/json',
+          'Accept': 'application/json',
+        },
+        sendData: jsonEncode({
           'userName': userName,
           'firstName': firstName,
           'lastName': lastName,
@@ -63,16 +121,19 @@ class AuthService {
         }),
       );
 
-      if (response.statusCode == 200) {
-        final data = jsonDecode(response.body);
+      final status = req.status ?? 0;
+      final bodyText = req.responseText ?? '';
+
+      if (status >= 200 && status < 300) {
+        final data = bodyText.isEmpty ? <String, dynamic>{} : jsonDecode(bodyText);
         return {'success': true, 'data': data};
-      } else {
-        final errorData = _safeDecode(response.body);
-        return {
-          'success': false,
-          'message': _extractMessage(errorData, 'Sign up failed'),
-        };
       }
+
+      final errorData = bodyText.isEmpty ? null : _safeDecode(bodyText);
+      return {
+        'success': false,
+        'message': _extractMessage(errorData, 'Sign up failed'),
+      };
     } catch (e) {
       // Network error should not be treated as success
       return {
@@ -143,25 +204,38 @@ class AuthService {
   }
 
   Future<Map<String, dynamic>> forgotPassword(String email) async {
-    try {
-      final response = await http.post(
-        Uri.parse('$_baseUrl/auth/forgot-password'),
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: jsonEncode({
-          'email': email,
-        }),
-      );
+    // Back-compat alias: this project uses OTP + ticket flow (not email reset-link)
+    return startForgotPasswordByEmail(email);
+  }
 
-      return jsonDecode(response.body);
-    } catch (e) {
-      // For development, return mock successful response
-      return {
-        'success': true,
-        'message': 'Password reset link sent to your email',
-      };
-    }
+  // ===== Forgot password (OTP via email) =====
+  // 1) Start: send OTP to email
+  Future<Map<String, dynamic>> startForgotPasswordByEmail(String email) async {
+    return _postJson('$_baseUrl/account/password/forgot/email/start', {
+      'email': email,
+    });
+  }
+
+  // 2) Verify: verify OTP and receive a ticket (string) in data
+  Future<Map<String, dynamic>> verifyForgotPasswordByEmail({
+    required String email,
+    required String code,
+  }) async {
+    return _postJson('$_baseUrl/account/password/forgot/email/verify', {
+      'email': email,
+      'code': code,
+    });
+  }
+
+  // 3) Commit: set new password using ticket
+  Future<Map<String, dynamic>> commitForgotPassword({
+    required String ticket,
+    required String newPassword,
+  }) async {
+    return _postJson('$_baseUrl/account/password/forgot/commit', {
+      'ticket': ticket,
+      'newPassword': newPassword,
+    });
   }
 
   Future<Map<String, dynamic>> verifyMFA(String code) async {
@@ -196,7 +270,7 @@ class AuthService {
           'token': 'mock_jwt_token_${DateTime.now().millisecondsSinceEpoch}',
         };
       }
-      
+
       return {
         'success': false,
         'message': 'Invalid verification code',
@@ -206,14 +280,37 @@ class AuthService {
 
   Future<Map<String, dynamic>> signOut() async {
     try {
-      final response = await http.post(
-        Uri.parse('$_baseUrl/auth/signout'),
-        headers: {
+      // Cookie-based auth (Google OAuth web) requires sending credentials.
+      // Also, the backend endpoint is /login/logout (see LoginController).
+      final url = Uri.parse('$_baseUrl/login/logout');
+
+      final req = await html.HttpRequest.request(
+        url.toString(),
+        method: 'POST',
+        withCredentials: true,
+        requestHeaders: {
           'Content-Type': 'application/json',
+          'Accept': 'application/json',
         },
       );
 
-      return jsonDecode(response.body);
+      final bodyText = req.responseText;
+      if (req.status != null && req.status! >= 200 && req.status! < 300) {
+        final data = bodyText == null || bodyText.isEmpty
+            ? <String, dynamic>{'success': true}
+            : jsonDecode(bodyText);
+        return (data is Map<String, dynamic>)
+            ? data
+            : {'success': true, 'data': data};
+      }
+
+      // If server returned an error, surface it.
+      final err =
+          bodyText == null || bodyText.isEmpty ? null : _safeDecode(bodyText);
+      return {
+        'success': false,
+        'message': _extractMessage(err, 'Sign out failed'),
+      };
     } catch (e) {
       // For development, return mock successful response
       return {
@@ -241,7 +338,8 @@ class AuthService {
     }
   }
 
-  Future<Map<String, dynamic>> updateProfile(Map<String, dynamic> profileData) async {
+  Future<Map<String, dynamic>> updateProfile(
+      Map<String, dynamic> profileData) async {
     try {
       final response = await http.put(
         Uri.parse('$_baseUrl/auth/profile'),
@@ -262,7 +360,8 @@ class AuthService {
     }
   }
 
-  Future<Map<String, dynamic>> changePassword(String currentPassword, String newPassword) async {
+  Future<Map<String, dynamic>> changePassword(
+      String currentPassword, String newPassword) async {
     try {
       final response = await http.put(
         Uri.parse('$_baseUrl/auth/change-password'),
@@ -290,7 +389,9 @@ class AuthService {
   // Frontend should navigate the browser to this URL.
   String getGoogleLoginRedirectUrl({String? returnUrl}) {
     // Optional returnUrl lets backend know where to send users after success.
-    final ru = returnUrl == null || returnUrl.isEmpty ? null : Uri.encodeComponent(returnUrl);
+    final ru = returnUrl == null || returnUrl.isEmpty
+        ? null
+        : Uri.encodeComponent(returnUrl);
     final path = '$_baseUrl/login/google-login';
     return ru == null ? path : '$path?returnUrl=$ru';
   }

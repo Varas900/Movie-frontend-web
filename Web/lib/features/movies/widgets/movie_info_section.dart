@@ -58,7 +58,7 @@ class MovieInfoSection extends StatelessWidget {
               const SizedBox(width: 12),
             ],
             
-            if (movie.formattedDuration.isNotEmpty) ...[
+            if ((movie.durationSeconds ?? 0) > 0) ...[
               Row(
                 children: [
                   Icon(
@@ -68,7 +68,7 @@ class MovieInfoSection extends StatelessWidget {
                   ),
                   const SizedBox(width: 4),
                   Text(
-                    movie.formattedDuration,
+                    '${movie.durationSeconds}s',
                     style: Theme.of(context).textTheme.bodyMedium?.copyWith(
                       color: Theme.of(context).colorScheme.onSurfaceVariant,
                     ),

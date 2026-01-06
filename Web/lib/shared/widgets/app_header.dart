@@ -22,7 +22,7 @@ class AppHeader extends ConsumerWidget {
   Widget build(BuildContext context, WidgetRef ref) {
     final user = ref.watch(currentUserProvider);
     final l10n = AppLocalizations.of(context)!;
-    
+
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
       decoration: BoxDecoration(
@@ -66,15 +66,15 @@ class AppHeader extends ConsumerWidget {
                 Text(
                   'FlixGo',
                   style: Theme.of(context).textTheme.titleLarge?.copyWith(
-                    fontWeight: FontWeight.bold,
-                  ),
+                        fontWeight: FontWeight.bold,
+                      ),
                 ),
               ],
             ),
           ),
-          
+
           const SizedBox(width: 32),
-          
+
           // Navigation Menu (Desktop)
           if (MediaQuery.of(context).size.width > 768) ...[
             _NavItem(
@@ -95,12 +95,14 @@ class AppHeader extends ConsumerWidget {
             const SizedBox(width: 24),
             _NavItem(
               label: 'Actors',
-              onTap: () => context.go('/actors'),
+              // Actor list page is not implemented; keep navigation consistent
+              // with existing routes.
+              onTap: () => context.go('/search'),
             ),
           ],
-          
+
           const Spacer(),
-          
+
           // Search Bar (Desktop)
           if (showSearchBar && MediaQuery.of(context).size.width > 768) ...[
             SizedBox(
@@ -124,7 +126,7 @@ class AppHeader extends ConsumerWidget {
             ),
             const SizedBox(width: 16),
           ],
-          
+
           // Action Icons
           Row(
             mainAxisSize: MainAxisSize.min,
@@ -132,27 +134,29 @@ class AppHeader extends ConsumerWidget {
               // Search Icon (Mobile)
               if (MediaQuery.of(context).size.width <= 768)
                 IconButton(
-                  onPressed: onSearchTap ?? () => context.push(AppRoutes.search),
+                  onPressed:
+                      onSearchTap ?? () => context.push(AppRoutes.search),
                   icon: const Icon(Icons.search),
                 ),
-              
+
               // Theme Toggle
               IconButton(
                 onPressed: () => ref.read(themeProvider.notifier).toggleTheme(),
                 icon: Icon(
-                  ref.watch(isDarkThemeProvider) 
-                    ? Icons.light_mode 
-                    : Icons.dark_mode,
+                  ref.watch(isDarkThemeProvider)
+                      ? Icons.light_mode
+                      : Icons.dark_mode,
                 ),
               ),
-              
+
               // Language Toggle
               IconButton(
-                onPressed: () => ref.read(languageProvider.notifier).toggleLanguage(),
+                onPressed: () =>
+                    ref.read(languageProvider.notifier).toggleLanguage(),
                 icon: const Icon(Icons.language),
                 tooltip: 'Language',
               ),
-              
+
               // Notifications
               IconButton(
                 onPressed: () {
@@ -160,9 +164,9 @@ class AppHeader extends ConsumerWidget {
                 },
                 icon: const Icon(Icons.notifications_outlined),
               ),
-              
+
               const SizedBox(width: 8),
-              
+
               // User Profile
               PopupMenuButton<String>(
                 onSelected: (value) {
@@ -171,7 +175,7 @@ class AppHeader extends ConsumerWidget {
                       context.push(AppRoutes.profile);
                       break;
                     case 'favorites':
-                      // Navigate to favorites
+                      context.push(AppRoutes.moviebox);
                       break;
                     case 'recent':
                       context.push(AppRoutes.recentViews);
@@ -209,7 +213,6 @@ class AppHeader extends ConsumerWidget {
                       dense: true,
                     ),
                   ),
-                  
                   const PopupMenuDivider(),
                   PopupMenuItem(
                     value: 'settings',
@@ -229,7 +232,8 @@ class AppHeader extends ConsumerWidget {
                   ),
                 ],
                 child: Container(
-                  padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                  padding:
+                      const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
                   decoration: BoxDecoration(
                     color: Theme.of(context).colorScheme.surface,
                     borderRadius: BorderRadius.circular(20),
@@ -272,9 +276,10 @@ class AppHeader extends ConsumerWidget {
                         const SizedBox(width: 8),
                         Text(
                           user?.displayName ?? 'User',
-                          style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                            fontWeight: FontWeight.w500,
-                          ),
+                          style:
+                              Theme.of(context).textTheme.bodyMedium?.copyWith(
+                                    fontWeight: FontWeight.w500,
+                                  ),
                         ),
                         const SizedBox(width: 4),
                         const Icon(Icons.keyboard_arrow_down, size: 16),
@@ -312,11 +317,11 @@ class _NavItem extends StatelessWidget {
         child: Text(
           label,
           style: Theme.of(context).textTheme.bodyLarge?.copyWith(
-            fontWeight: isActive ? FontWeight.w600 : FontWeight.normal,
-            color: isActive 
-                ? Theme.of(context).colorScheme.primary
-                : Theme.of(context).colorScheme.onSurface,
-          ),
+                fontWeight: isActive ? FontWeight.w600 : FontWeight.normal,
+                color: isActive
+                    ? Theme.of(context).colorScheme.primary
+                    : Theme.of(context).colorScheme.onSurface,
+              ),
         ),
       ),
     );

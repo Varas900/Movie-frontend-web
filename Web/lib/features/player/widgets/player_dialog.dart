@@ -4,6 +4,9 @@ import 'package:http/http.dart' as http;
 import 'package:chewie/chewie.dart';
 import 'package:video_player/video_player.dart';
 import '../../../core/utils/app_constants.dart';
+import '../../../core/services/storage_service.dart';
+import '../../../core/utils/authz_prompt.dart';
+import 'youtube_embed_player.dart';
 
 class PlayerDialog extends StatefulWidget {
   final int movieId;
@@ -18,22 +21,27 @@ class _PlayableSource {
   final String url;
   final String? quality;
   final bool isVip;
-  const _PlayableSource({this.id, required this.url, this.quality, this.isVip = false});
+  const _PlayableSource(
+      {this.id, required this.url, this.quality, this.isVip = false});
 }
 
-class _PlayerDialogState extends State<PlayerDialog> with SingleTickerProviderStateMixin {
+class _PlayerDialogState extends State<PlayerDialog>
+    with SingleTickerProviderStateMixin {
   bool _isLoading = true;
   String? _error;
   List<_PlayableSource> _sources = [];
   VideoPlayerController? _videoController;
   ChewieController? _chewieController;
+  bool _useYoutubeEmbed = false;
+  String? _youtubeUrl;
   late final AnimationController _animController;
   late final Animation<double> _scaleAnim;
 
   @override
   void initState() {
     super.initState();
-    _animController = AnimationController(vsync: this, duration: const Duration(milliseconds: 1000));
+    _animController = AnimationController(
+        vsync: this, duration: const Duration(milliseconds: 1000));
     _scaleAnim = Tween<double>(begin: 0.85, end: 1.0).animate(
       CurvedAnimation(parent: _animController, curve: Curves.easeOutCubic),
     );
@@ -41,33 +49,74 @@ class _PlayerDialogState extends State<PlayerDialog> with SingleTickerProviderSt
     _animController.forward();
   }
 
+  String _friendlyAuthError(Object e) {
+    final msg = e.toString();
+    final prompt = authzPromptFromError(e);
+    if (prompt == AuthzPromptType.signIn) return 'Please sign in to continue.';
+    if (prompt == AuthzPromptType.buyPlan) return 'Please buy a plan to continue.';
+    return 'Failed to load source: $e';
+  }
+
   Future<void> _loadAndPlay() async {
-    setState(() { _isLoading = true; _error = null; _sources = []; });
+    setState(() {
+      _isLoading = true;
+      _error = null;
+      _sources = [];
+    });
     try {
+      final token = StorageService.getUserToken();
+      if (token == null || token.trim().isEmpty) {
+        setState(() {
+          _error = 'Please sign in to continue.';
+          _isLoading = false;
+        });
+        return;
+      }
       final primary = await _fetchPublicSources(widget.movieId);
       if (primary.isNotEmpty) {
         _sources = primary;
         await _setup(primary.first);
-        setState(() { _isLoading = false; });
+        setState(() {
+          _isLoading = false;
+        });
         return;
       }
-      final fallback = await _fetchWatchNow(widget.movieId);
-      if (fallback.isNotEmpty) {
-        _sources = fallback;
-        await _setup(fallback.first);
-        setState(() { _isLoading = false; });
-        return;
-      }
-      setState(() { _error = 'No playable sources available.'; _isLoading = false; });
+      setState(() {
+        _error = 'No playable sources available.';
+        _isLoading = false;
+      });
     } catch (e) {
-      setState(() { _error = 'Failed to load source: $e'; _isLoading = false; });
+      setState(() {
+        _error = _friendlyAuthError(e);
+        _isLoading = false;
+      });
     }
   }
 
   Future<List<_PlayableSource>> _fetchPublicSources(int movieId) async {
-    final url = Uri.parse('${AppConstants.baseApiUrl}/movie/MovieSource/GetMovieSourcesByMovieIdPublic/getByMovieId/$movieId');
-    final res = await http.get(url);
-    if (res.statusCode != 200) return [];
+    final url = Uri.parse(
+        '${AppConstants.baseApiUrl}/movie/MovieSource/GetMovieSourcesByMovieIdPublic/getByMovieId/$movieId');
+    final headers = <String, String>{
+      'Accept': 'application/json',
+    };
+    final token = StorageService.getUserToken();
+    if (token != null && token.trim().isNotEmpty) {
+      headers['Authorization'] = 'Bearer ${token.trim()}';
+    }
+
+    final res = await http.get(url, headers: headers);
+
+    if (res.statusCode == 401) {
+      throw Exception('HTTP_401');
+    }
+    if (res.statusCode == 403) {
+      throw Exception('HTTP_403');
+    }
+    if (res.statusCode != 200) {
+      final bodyPreview =
+          res.body.length > 500 ? res.body.substring(0, 500) : res.body;
+      throw Exception('MovieSources HTTP ${res.statusCode}: $bodyPreview');
+    }
     final body = jsonDecode(res.body);
     final data = body is Map ? (body['data'] ?? body['Data'] ?? body) : body;
     final list = <_PlayableSource>[];
@@ -79,37 +128,11 @@ class _PlayerDialogState extends State<PlayerDialog> with SingleTickerProviderSt
             final id = it['movieSourceID'] ?? it['sourceID'] ?? it['id'];
             final q = it['quality']?.toString();
             final vip = it['isVipOnly'] == true || it['isVip'] == true;
-            list.add(_PlayableSource(id: id is int ? id : int.tryParse('$id'), url: src, quality: q, isVip: vip));
-          }
-        }
-      }
-    }
-    return list;
-  }
-
-  Future<List<_PlayableSource>> _fetchWatchNow(int movieId) async {
-    final url = Uri.parse('${AppConstants.baseApiUrl}/api/Movie/GetWatchNowMovieByID/watchNow/$movieId');
-    final res = await http.get(url);
-    if (res.statusCode != 200) return [];
-    final body = jsonDecode(res.body);
-    final list = <_PlayableSource>[];
-    if (body is Map) {
-      final src = body['sourceUrl'] ?? body['url'] ?? body['movieUrl'];
-      if (src is String && src.isNotEmpty) {
-        final id = body['sourceID'] ?? body['id'];
-        final q = body['quality']?.toString();
-        list.add(_PlayableSource(id: id is int ? id : int.tryParse('$id'), url: src, quality: q));
-      }
-      final many = body['data'] ?? body['sources'];
-      if (many is List) {
-        for (final m in many) {
-          if (m is Map) {
-            final s = m['sourceUrl'] ?? m['url'];
-            if (s is String && s.isNotEmpty) {
-              final id = m['sourceID'] ?? m['id'];
-              final q = m['quality']?.toString();
-              list.add(_PlayableSource(id: id is int ? id : int.tryParse('$id'), url: s, quality: q));
-            }
+            list.add(_PlayableSource(
+                id: id is int ? id : int.tryParse('$id'),
+                url: src,
+                quality: q,
+                isVip: vip));
           }
         }
       }
@@ -120,6 +143,16 @@ class _PlayerDialogState extends State<PlayerDialog> with SingleTickerProviderSt
   Future<void> _setup(_PlayableSource s) async {
     try {
       _disposePlayer();
+
+      if (isYoutubeUrl(s.url)) {
+        setState(() {
+          _useYoutubeEmbed = true;
+          _youtubeUrl = s.url;
+          _error = null;
+        });
+        return;
+      }
+
       final controller = VideoPlayerController.networkUrl(Uri.parse(s.url));
       await controller.initialize();
       final chewie = ChewieController(
@@ -130,9 +163,21 @@ class _PlayerDialogState extends State<PlayerDialog> with SingleTickerProviderSt
       setState(() {
         _videoController = controller;
         _chewieController = chewie;
+        _useYoutubeEmbed = false;
+        _youtubeUrl = null;
       });
     } catch (e) {
-      setState(() { _error = 'Playback failed: $e'; });
+      if (isYoutubeUrl(s.url)) {
+        setState(() {
+          _useYoutubeEmbed = true;
+          _youtubeUrl = s.url;
+          _error = null;
+        });
+        return;
+      }
+      setState(() {
+        _error = 'Playback failed: $e';
+      });
     }
   }
 
@@ -141,6 +186,8 @@ class _PlayerDialogState extends State<PlayerDialog> with SingleTickerProviderSt
     _chewieController = null;
     _videoController?.dispose();
     _videoController = null;
+    _useYoutubeEmbed = false;
+    _youtubeUrl = null;
   }
 
   @override
@@ -168,7 +215,11 @@ class _PlayerDialogState extends State<PlayerDialog> with SingleTickerProviderSt
                 Row(
                   mainAxisAlignment: MainAxisAlignment.spaceBetween,
                   children: [
-                    const Text('Now Playing', style: TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.w600)),
+                    const Text('Now Playing',
+                        style: TextStyle(
+                            color: Colors.white,
+                            fontSize: 16,
+                            fontWeight: FontWeight.w600)),
                     IconButton(
                       onPressed: () => Navigator.of(context).pop(),
                       icon: const Icon(Icons.close, color: Colors.white),
@@ -177,14 +228,19 @@ class _PlayerDialogState extends State<PlayerDialog> with SingleTickerProviderSt
                 ),
                 const SizedBox(height: 8),
                 AspectRatio(
-                  aspectRatio: _videoController?.value.aspectRatio ?? 16/9,
+                  aspectRatio: _videoController?.value.aspectRatio ?? 16 / 9,
                   child: _isLoading
                       ? const Center(child: CircularProgressIndicator())
                       : _error != null
-                          ? Center(child: Text(_error!, style: const TextStyle(color: Colors.white70)))
-                          : _chewieController == null
-                              ? const SizedBox.shrink()
-                              : Chewie(controller: _chewieController!),
+                          ? Center(
+                              child: Text(_error!,
+                                  style:
+                                      const TextStyle(color: Colors.white70)))
+                          : (_useYoutubeEmbed && _youtubeUrl != null)
+                              ? YoutubeEmbedPlayer(url: _youtubeUrl!)
+                              : (_chewieController == null
+                                  ? const SizedBox.shrink()
+                                  : Chewie(controller: _chewieController!)),
                 ),
               ],
             ),

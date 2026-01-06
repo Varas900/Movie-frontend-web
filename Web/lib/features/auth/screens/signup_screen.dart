@@ -2,10 +2,12 @@ import 'package:flutter/material.dart';
 import 'package:flixgo_web/core/routing/app_router.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
+import 'package:url_launcher/url_launcher.dart';
 
 import '../../../core/providers/auth_provider.dart';
 import '../../../core/routing/app_router.dart';
 import '../../../core/l10n/app_localizations.dart';
+import '../../../core/services/auth_service.dart';
 import '../widgets/auth_background.dart';
 
 class SignUpScreen extends ConsumerStatefulWidget {
@@ -23,6 +25,7 @@ class _SignUpScreenState extends ConsumerState<SignUpScreen> {
   final _emailController = TextEditingController();
   final _passwordController = TextEditingController();
   final _confirmPasswordController = TextEditingController();
+  final _authService = AuthService();
   String? _selectedGender; // start empty so label floats like other fields
   
   bool _obscurePassword = true;
@@ -54,6 +57,18 @@ class _SignUpScreenState extends ConsumerState<SignUpScreen> {
       if (userId != null && mounted) {
         context.go('${AppRoutes.mfaVerification}?userID=$userId');
       }
+    }
+  }
+
+  Future<void> _startGoogleSignUp() async {
+    // For web, Google sign-up is the same as Google sign-in.
+    // Backend will create/link the account during OAuth.
+    final returnUrl = Uri.base.origin; // must be allowlisted in API config
+    final url = _authService.getGoogleLoginRedirectUrl(returnUrl: returnUrl);
+    try {
+      await launchUrl(Uri.parse(url), mode: LaunchMode.externalApplication);
+    } catch (_) {
+      if (mounted) context.push(url);
     }
   }
 
@@ -329,6 +344,19 @@ class _SignUpScreenState extends ConsumerState<SignUpScreen> {
                                 fontWeight: FontWeight.w600,
                               ),
                             ),
+                    ),
+
+                    const SizedBox(height: 12),
+
+                    // Google Sign-up (OAuth redirect handled by backend)
+                    OutlinedButton.icon(
+                      onPressed: authState.isLoading ? null : _startGoogleSignUp,
+                      icon: const Icon(Icons.login),
+                      label: const Text('Continue with Google'),
+                      style: OutlinedButton.styleFrom(
+                        padding: const EdgeInsets.symmetric(vertical: 14),
+                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                      ),
                     ),
                     
                     // Error Message

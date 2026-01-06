@@ -1,7 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:go_router/go_router.dart';
 
-import '../../../core/models/actor_model.dart';
 import '../../../core/models/movie_model.dart';
 import '../../../core/routing/app_router.dart';
 import '../../../shared/widgets/image_with_placeholder.dart';
@@ -27,8 +26,8 @@ class CastSection extends StatelessWidget {
             Text(
               'Cast & Crew',
               style: Theme.of(context).textTheme.titleLarge?.copyWith(
-                fontWeight: FontWeight.bold,
-              ),
+                    fontWeight: FontWeight.bold,
+                  ),
             ),
             if (actors.length > 5)
               TextButton(
@@ -61,7 +60,7 @@ class CastSection extends StatelessWidget {
       margin: const EdgeInsets.only(right: 12),
       child: GestureDetector(
         onTap: () {
-          context.push('/actors/${actor.personId}');
+          context.push('${AppRoutes.actorDetails}/${actor.personId}');
         },
         child: Column(
           children: [
@@ -81,36 +80,41 @@ class CastSection extends StatelessWidget {
               ),
               child: ClipRRect(
                 borderRadius: BorderRadius.circular(40),
-                ActorAvatarImage(
+                child: ActorAvatarImage(
                   imageUrl: actor.avatar,
                   radius: 40,
-                  fallbackText: actor.fullName.split(' ').map((e) => e[0]).take(2).join(),
+                  fallbackText: actor.fullName
+                      .split(' ')
+                      .where((e) => e.isNotEmpty)
+                      .map((e) => e[0])
+                      .take(2)
+                      .join(),
                 ),
               ),
             ),
-            
+
             const SizedBox(height: 8),
-            
+
             // Actor Name
             Text(
-              actor.name,
+              actor.fullName,
               style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                fontWeight: FontWeight.w600,
-              ),
+                    fontWeight: FontWeight.w600,
+                  ),
               maxLines: 2,
               textAlign: TextAlign.center,
               overflow: TextOverflow.ellipsis,
             ),
-            
+
             const SizedBox(height: 4),
-            
+
             // Character Name
-            if (actor.character?.isNotEmpty == true)
+            if (actor.characterName?.isNotEmpty == true)
               Text(
-                actor.character!,
+                actor.characterName!,
                 style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                  color: Theme.of(context).colorScheme.onSurfaceVariant,
-                ),
+                      color: Theme.of(context).colorScheme.onSurfaceVariant,
+                    ),
                 maxLines: 2,
                 textAlign: TextAlign.center,
                 overflow: TextOverflow.ellipsis,
@@ -146,11 +150,14 @@ class CastSection extends StatelessWidget {
                   height: 4,
                   margin: const EdgeInsets.symmetric(vertical: 12),
                   decoration: BoxDecoration(
-                    color: Theme.of(context).colorScheme.onSurfaceVariant.withOpacity(0.4),
+                    color: Theme.of(context)
+                        .colorScheme
+                        .onSurfaceVariant
+                        .withOpacity(0.4),
                     borderRadius: BorderRadius.circular(2),
                   ),
                 ),
-                
+
                 // Header
                 Padding(
                   padding: const EdgeInsets.symmetric(horizontal: 16),
@@ -159,9 +166,10 @@ class CastSection extends StatelessWidget {
                       Expanded(
                         child: Text(
                           'Full Cast & Crew',
-                          style: Theme.of(context).textTheme.titleLarge?.copyWith(
-                            fontWeight: FontWeight.bold,
-                          ),
+                          style:
+                              Theme.of(context).textTheme.titleLarge?.copyWith(
+                                    fontWeight: FontWeight.bold,
+                                  ),
                         ),
                       ),
                       IconButton(
@@ -171,15 +179,16 @@ class CastSection extends StatelessWidget {
                     ],
                   ),
                 ),
-                
+
                 const Divider(),
-                
+
                 // Cast Grid
                 Expanded(
                   child: GridView.builder(
                     controller: scrollController,
                     padding: const EdgeInsets.all(16),
-                    gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+                    gridDelegate:
+                        const SliverGridDelegateWithFixedCrossAxisCount(
                       crossAxisCount: 3,
                       childAspectRatio: 0.7,
                       crossAxisSpacing: 12,
@@ -200,11 +209,11 @@ class CastSection extends StatelessWidget {
     );
   }
 
-  Widget _buildFullCastCard(BuildContext context, Actor actor) {
+  Widget _buildFullCastCard(BuildContext context, MovieActor actor) {
     return GestureDetector(
       onTap: () {
         Navigator.of(context).pop();
-        context.push('${AppRoutes.actor}/${actor.actorId}');
+        context.push('${AppRoutes.actorDetails}/${actor.personId}');
       },
       child: Column(
         children: [
@@ -224,17 +233,19 @@ class CastSection extends StatelessWidget {
               ),
               child: ClipRRect(
                 borderRadius: BorderRadius.circular(8),
-                child: ActorAvatarImage(
-                  imageUrl: actor.image,
+                child: ImageWithPlaceholder(
+                  imageUrl: actor.avatar,
                   width: double.infinity,
                   height: double.infinity,
+                  fit: BoxFit.cover,
+                  borderRadius: BorderRadius.circular(8),
                 ),
               ),
             ),
           ),
-          
+
           const SizedBox(height: 8),
-          
+
           // Actor Info
           Expanded(
             flex: 2,
@@ -242,24 +253,24 @@ class CastSection extends StatelessWidget {
               children: [
                 // Actor Name
                 Text(
-                  actor.name,
+                  actor.fullName,
                   style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                    fontWeight: FontWeight.w600,
-                  ),
+                        fontWeight: FontWeight.w600,
+                      ),
                   maxLines: 2,
                   textAlign: TextAlign.center,
                   overflow: TextOverflow.ellipsis,
                 ),
-                
+
                 const SizedBox(height: 4),
-                
+
                 // Character Name
-                if (actor.character?.isNotEmpty == true)
+                if (actor.characterName?.isNotEmpty == true)
                   Text(
-                    actor.character!,
+                    actor.characterName!,
                     style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                      color: Theme.of(context).colorScheme.onSurfaceVariant,
-                    ),
+                          color: Theme.of(context).colorScheme.onSurfaceVariant,
+                        ),
                     maxLines: 2,
                     textAlign: TextAlign.center,
                     overflow: TextOverflow.ellipsis,

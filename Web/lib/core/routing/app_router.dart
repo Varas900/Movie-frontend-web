@@ -10,6 +10,7 @@ import '../../features/auth/screens/mfa_verification_screen.dart';
 import '../../features/home/screens/home_screen.dart';
 import '../../features/movies/screens/movie_details_screen.dart';
 import '../../features/movies/screens/series_details_screen.dart';
+import '../../features/movies/screens/moviebox_screen.dart';
 import '../../features/actors/screens/actor_details_screen.dart';
 import '../../features/categories/screens/category_screen.dart';
 import '../../features/player/screens/player_screen.dart';
@@ -37,6 +38,7 @@ class AppRoutes {
   static const String profile = '/profile';
   static const String recentViews = '/recent-views';
   static const String reviews = '/reviews';
+  static const String moviebox = '/moviebox';
   static const String aboutUs = '/about-us';
   static const String helpCenter = '/help-center';
   static const String contacts = '/contacts';
@@ -60,6 +62,7 @@ final routerProvider = Provider<GoRouter>((ref) {
         AppRoutes.signup,
         AppRoutes.forgotPassword,
         AppRoutes.mfaVerification,
+        AppRoutes.search,
         AppRoutes.aboutUs,
         AppRoutes.helpCenter,
         AppRoutes.contacts,
@@ -67,12 +70,16 @@ final routerProvider = Provider<GoRouter>((ref) {
       ];
 
       // If user is not authenticated and trying to access protected route
-      if (!isAuthenticated && !publicRoutes.contains(location) && !location.startsWith('/movie') && !location.startsWith('/series')) {
+      if (!isAuthenticated &&
+          !publicRoutes.contains(location) &&
+          !location.startsWith('/movie') &&
+          !location.startsWith('/series')) {
         return AppRoutes.signin;
       }
 
       // If user is authenticated and trying to access auth routes
-      if (isAuthenticated && [AppRoutes.signin, AppRoutes.signup].contains(location)) {
+      if (isAuthenticated &&
+          [AppRoutes.signin, AppRoutes.signup].contains(location)) {
         return AppRoutes.home;
       }
 
@@ -156,7 +163,7 @@ final routerProvider = Provider<GoRouter>((ref) {
           final contentId = int.parse(state.pathParameters['id']!);
           final contentType = state.uri.queryParameters['type'] ?? 'movie';
           final episodeId = state.uri.queryParameters['episode'];
-          
+
           return PlayerScreen(
             contentId: contentId,
             contentType: contentType,
@@ -178,6 +185,10 @@ final routerProvider = Provider<GoRouter>((ref) {
       GoRoute(
         path: AppRoutes.profile,
         builder: (context, state) => const ProfileScreen(),
+      ),
+      GoRoute(
+        path: AppRoutes.moviebox,
+        builder: (context, state) => const MovieBoxScreen(),
       ),
       GoRoute(
         path: AppRoutes.recentViews,
@@ -228,12 +239,20 @@ final routerProvider = Provider<GoRouter>((ref) {
 
 // Helper extension for navigation (renamed to avoid conflicts)
 extension FlixGoNavigation on BuildContext {
-  void pushNamed(String name, {Map<String, String>? pathParameters, Map<String, dynamic>? queryParameters}) {
-    GoRouter.of(this).pushNamed(name, pathParameters: pathParameters ?? {}, queryParameters: queryParameters ?? {});
+  void pushNamed(String name,
+      {Map<String, String>? pathParameters,
+      Map<String, dynamic>? queryParameters}) {
+    GoRouter.of(this).pushNamed(name,
+        pathParameters: pathParameters ?? {},
+        queryParameters: queryParameters ?? {});
   }
 
-  void goNamed(String name, {Map<String, String>? pathParameters, Map<String, dynamic>? queryParameters}) {
-    GoRouter.of(this).goNamed(name, pathParameters: pathParameters ?? {}, queryParameters: queryParameters ?? {});
+  void goNamed(String name,
+      {Map<String, String>? pathParameters,
+      Map<String, dynamic>? queryParameters}) {
+    GoRouter.of(this).goNamed(name,
+        pathParameters: pathParameters ?? {},
+        queryParameters: queryParameters ?? {});
   }
 
   void goBack() {

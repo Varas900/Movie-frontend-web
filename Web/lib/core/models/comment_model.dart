@@ -24,11 +24,21 @@ class Comment {
   });
 
   factory Comment.fromJson(Map<String, dynamic> json) {
+    final dynamic userObj = json['user'];
+    final Map<String, dynamic>? userMap = userObj is Map<String, dynamic>
+        ? userObj
+        : (userObj is Map ? Map<String, dynamic>.from(userObj) : null);
+
     return Comment(
       commentID: (json['commentID'] as num?)?.toInt() ?? 0,
       movieID: (json['movieID'] as num?)?.toInt() ?? 0,
       userID: (json['userID'] as num?)?.toInt() ?? 0,
-      userName: json['userName'] as String?,
+      userName: (json['userName'] ??
+              json['username'] ??
+              json['UserName'] ??
+              userMap?['userName'] ??
+              userMap?['UserName'])
+          as String?,
       content: json['content'] as String? ?? '',
       parentID: (json['parentID'] as num?)?.toInt(),
       isEdited: json['isEdited'] as bool? ?? false,

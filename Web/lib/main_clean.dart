@@ -1,18 +1,25 @@
 import 'package:flutter/material.dart';
 import 'dart:convert';
 import 'dart:html' as html;
-import 'dart:convert';
+import 'dart:typed_data';
 import 'package:http/http.dart' as http;
+import 'package:http/browser_client.dart';
 import 'dart:async';
 import 'package:flixgo_web/core/utils/app_constants.dart';
 import 'package:go_router/go_router.dart';
 import 'package:flixgo_web/core/services/auth_service.dart';
+import 'package:flixgo_web/core/services/user_service.dart';
 import 'package:flixgo_web/core/services/storage_service.dart';
+import 'package:flixgo_web/features/actors/screens/actor_details_screen.dart';
+import 'package:image_picker/image_picker.dart';
 import 'package:url_launcher/url_launcher.dart';
 import 'package:video_player/video_player.dart';
 import 'package:chewie/chewie.dart';
 import 'package:flutter/services.dart';
 import 'package:intl/intl.dart';
+import 'package:flixgo_web/features/player/widgets/youtube_embed_player.dart';
+import 'package:flixgo_web/core/utils/url_utils.dart';
+import 'package:flixgo_web/core/utils/authz_prompt.dart';
 
 // Simple global auth flag. In a real app, replace with Provider/Bloc.
 final ValueNotifier<bool> isLoggedIn = ValueNotifier<bool>(false);
@@ -20,8 +27,297 @@ final ValueNotifier<bool> isLoggedIn = ValueNotifier<bool>(false);
 final ValueNotifier<Map<String, String>?> currentUserInfo =
     ValueNotifier<Map<String, String>?>(null);
 
+// Bump this whenever avatar changes to bypass browser cache.
+final ValueNotifier<String> avatarCacheBuster = ValueNotifier<String>('');
+
+// Saved movies (MovieBox) state
+final ValueNotifier<Set<int>> savedMovieIds = ValueNotifier<Set<int>>(<int>{});
+final ValueNotifier<Map<int, int>> savedMovieIdMap =
+    ValueNotifier<Map<int, int>>(<int, int>{});
+final ValueNotifier<Map<int, DateTime>> savedMovieCreatedAtMap =
+  ValueNotifier<Map<int, DateTime>>(<int, DateTime>{});
+
+int? _currentUserIdOrNull() {
+  final info = currentUserInfo.value;
+  final userIdStr = info?['userID'] ?? info?['userId'];
+  final userId = int.tryParse(userIdStr ?? '');
+  if (userId == null || userId <= 0) return null;
+  return userId;
+}
+
+Future<void> refreshSavedMoviesForCurrentUser() async {
+  final userId = _currentUserIdOrNull();
+  if (userId == null) {
+    savedMovieIds.value = <int>{};
+    savedMovieIdMap.value = <int, int>{};
+    savedMovieCreatedAtMap.value = <int, DateTime>{};
+    return;
+  }
+
+  try {
+    final uri = Uri.parse(
+        '${AppConstants.baseApiUrl}/api/SavedMovie/GetSavedMoviesByUserID/user/$userId');
+    final res = await _httpClient.get(uri, headers: _authHeaders());
+    if (res.statusCode == 401 || res.statusCode == 403) {
+      savedMovieIds.value = <int>{};
+      savedMovieIdMap.value = <int, int>{};
+      savedMovieCreatedAtMap.value = <int, DateTime>{};
+      return;
+    }
+    if (res.statusCode != 200) return;
+
+    final decoded = jsonDecode(res.body);
+    final data = _unwrapResponseData(decoded);
+    if (data is! List) return;
+
+    final ids = <int>{};
+    final map = <int, int>{};
+    final createdAt = <int, DateTime>{};
+    for (final item in data) {
+      if (item is! Map) continue;
+      final m = Map<String, dynamic>.from(item as Map);
+      final movieId = (m['movieID'] as num?)?.toInt() ??
+          (m['movieId'] as num?)?.toInt() ??
+          0;
+      final savedId = (m['savedMovieID'] as num?)?.toInt() ??
+          (m['savedMovieId'] as num?)?.toInt() ??
+          (m['id'] as num?)?.toInt() ??
+          0;
+      final createdAtRaw = m['createdAt'] ?? m['CreatedAt'] ?? m['created_at'];
+      final createdAtDt = DateTime.tryParse(createdAtRaw?.toString() ?? '');
+      if (movieId > 0) {
+        ids.add(movieId);
+        if (savedId > 0) map[movieId] = savedId;
+        if (createdAtDt != null) createdAt[movieId] = createdAtDt;
+      }
+    }
+
+    savedMovieIds.value = ids;
+    savedMovieIdMap.value = map;
+    savedMovieCreatedAtMap.value = createdAt;
+  } catch (_) {
+    // ignore
+  }
+}
+
+Future<void> addToMovieBox(int movieId) async {
+  final userId = _currentUserIdOrNull();
+  if (userId == null) throw Exception('HTTP_401');
+
+  // optimistic
+  savedMovieIds.value = Set<int>.from(savedMovieIds.value)..add(movieId);
+
+  final uri = Uri.parse(
+      '${AppConstants.baseApiUrl}/api/SavedMovie/CreateSavedMovie');
+  final res = await _httpClient.post(
+    uri,
+    headers: _authHeaders(),
+    body: jsonEncode({'userID': userId, 'movieID': movieId}),
+  );
+
+  if (res.statusCode == 401) {
+    savedMovieIds.value = Set<int>.from(savedMovieIds.value)..remove(movieId);
+    throw Exception('HTTP_401');
+  }
+  if (res.statusCode == 403) {
+    savedMovieIds.value = Set<int>.from(savedMovieIds.value)..remove(movieId);
+    throw Exception('HTTP_403');
+  }
+
+  if (res.statusCode == 400) {
+    // treat "already saved" as ok
+    await refreshSavedMoviesForCurrentUser();
+    return;
+  }
+
+  if (res.statusCode != 200 && res.statusCode != 201) {
+    savedMovieIds.value = Set<int>.from(savedMovieIds.value)..remove(movieId);
+    throw Exception('Failed to save movie (HTTP ${res.statusCode})');
+  }
+
+  try {
+    final decoded = jsonDecode(res.body);
+    final data = _unwrapResponseData(decoded);
+    if (data is Map) {
+      final m = Map<String, dynamic>.from(data as Map);
+      final savedId = (m['savedMovieID'] as num?)?.toInt() ??
+          (m['savedMovieId'] as num?)?.toInt() ??
+          (m['id'] as num?)?.toInt();
+      if (savedId != null && savedId > 0) {
+        final newMap = Map<int, int>.from(savedMovieIdMap.value);
+        newMap[movieId] = savedId;
+        savedMovieIdMap.value = newMap;
+      }
+    }
+  } catch (_) {
+    // ignore
+  }
+
+  await refreshSavedMoviesForCurrentUser();
+}
+
+Future<void> removeFromMovieBox(int movieId) async {
+  final userId = _currentUserIdOrNull();
+  if (userId == null) throw Exception('HTTP_401');
+
+  var savedId = savedMovieIdMap.value[movieId];
+  if (savedId == null || savedId <= 0) {
+    await refreshSavedMoviesForCurrentUser();
+    savedId = savedMovieIdMap.value[movieId];
+  }
+
+  // optimistic
+  savedMovieIds.value = Set<int>.from(savedMovieIds.value)..remove(movieId);
+  final newMap = Map<int, int>.from(savedMovieIdMap.value);
+  newMap.remove(movieId);
+  savedMovieIdMap.value = newMap;
+
+  if (savedId == null || savedId <= 0) return;
+
+  final uri = Uri.parse(
+      '${AppConstants.baseApiUrl}/api/SavedMovie/DeleteSavedMovie/$savedId');
+  final res = await _httpClient.delete(uri, headers: _authHeaders());
+  if (res.statusCode == 404) return;
+  if (res.statusCode == 401) {
+    await refreshSavedMoviesForCurrentUser();
+    throw Exception('HTTP_401');
+  }
+  if (res.statusCode == 403) {
+    await refreshSavedMoviesForCurrentUser();
+    throw Exception('HTTP_403');
+  }
+  if (res.statusCode != 200 && res.statusCode != 204) {
+    await refreshSavedMoviesForCurrentUser();
+    throw Exception('Failed to remove saved movie (HTTP ${res.statusCode})');
+  }
+}
+
+Future<void> _ensureCurrentUserFromCookiesIfNeeded() async {
+  if (currentUserInfo.value != null && isLoggedIn.value) return;
+  try {
+    final url = Uri.parse('${AppConstants.baseApiUrl}/user/me');
+    final req = await html.HttpRequest.request(
+      url.toString(),
+      method: 'GET',
+      withCredentials: true,
+    );
+    if (req.status == 200 && req.responseText != null) {
+      final body = json.decode(req.responseText!);
+      final data = (body is Map<String, dynamic>)
+          ? (body['data'] ?? body['Data'] ?? body)
+          : body;
+      if (data is Map<String, dynamic>) {
+        final Map<String, dynamic>? profile = (data['profile'] is Map)
+            ? Map<String, dynamic>.from(data['profile'] as Map)
+            : null;
+        final userName =
+            (data['userName'] ?? data['UserName'] ?? data['name'] ?? '')
+                .toString();
+        final email = (data['email'] ?? data['Email'] ?? '').toString();
+        final userId =
+            (data['userID'] ?? data['UserID'] ?? data['id'])?.toString();
+        final firstName =
+            (data['firstName'] ?? profile?['firstName'] ?? '').toString();
+        final lastName =
+            (data['lastName'] ?? profile?['lastName'] ?? '').toString();
+        final avatar = (data['avatar'] ?? profile?['avatar'] ?? '').toString();
+        final gender = (data['gender'] ?? profile?['gender'] ?? '').toString();
+        final dateOfBirth =
+            (data['dateOfBirth'] ?? profile?['dateOfBirth'] ?? '').toString();
+        currentUserInfo.value = {
+          'userName': userName,
+          'email': email,
+          if (userId != null) 'userID': userId,
+          if (firstName.isNotEmpty) 'firstName': firstName,
+          if (lastName.isNotEmpty) 'lastName': lastName,
+          if (avatar.isNotEmpty) 'avatar': avatar,
+          if (gender.isNotEmpty) 'gender': gender,
+          if (dateOfBirth.isNotEmpty) 'dateOfBirth': dateOfBirth,
+        };
+        isLoggedIn.value = true;
+      }
+    }
+  } catch (_) {
+    // ignore
+  }
+}
+
 void main() {
   runApp(const FlixGoApp());
+}
+
+final BrowserClient _httpClient = BrowserClient()..withCredentials = true;
+
+Map<String, String> _authHeaders() {
+  final headers = <String, String>{
+    'Accept': 'application/json',
+    'Content-Type': 'application/json',
+  };
+  final token = StorageService.getUserToken();
+  if (token != null && token.trim().isNotEmpty) {
+    headers['Authorization'] = 'Bearer ${token.trim()}';
+  }
+  return headers;
+}
+
+dynamic _unwrapResponseData(dynamic body) {
+  if (body is Map<String, dynamic>) {
+    return body['data'] ?? body['Data'] ?? body['result'] ?? body;
+  }
+  return body;
+}
+
+String _previewBody(String s, {int max = 400}) {
+  if (s.length <= max) return s;
+  return s.substring(0, max);
+}
+
+Future<Movie> _fetchBasicMovieByIdForMovieBox(int movieId) async {
+  final uri =
+      Uri.parse('${AppConstants.baseApiUrl}/api/Movie/GetMovieById/$movieId');
+  final res = await _httpClient.get(uri, headers: _authHeaders());
+  if (res.statusCode != 200) {
+    throw Exception(
+        'GetMovieById HTTP ${res.statusCode}: ${_previewBody(res.body)}');
+  }
+
+  final body = jsonDecode(res.body);
+  final data = _unwrapResponseData(body);
+  if (data is! Map<String, dynamic>) {
+    throw Exception('Unexpected response shape');
+  }
+
+  final title = (data['title'] as String?) ??
+      (data['originalTitle'] as String?) ??
+      'Untitled';
+  final description = (data['description'] as String?) ?? '';
+  final imageUrl = (data['image'] as String?) ??
+      'https://via.placeholder.com/300x400?text=No+Image';
+
+  final releaseDate = DateTime.tryParse(data['releaseDate']?.toString() ?? '');
+  final yearInt = (data['year'] as num?)?.toInt();
+  final year = (yearInt != null && yearInt > 0)
+      ? yearInt.toString()
+      : (releaseDate != null ? releaseDate.year.toString() : '—');
+
+  final rated = (data['rated'] as String?)?.trim();
+  final rating = (rated != null && rated.isNotEmpty) ? rated : 'NR';
+  final popularity = (data['popularity'] as num?)?.toDouble() ?? 0.0;
+
+  return Movie(
+    id: (data['movieID'] as num?)?.toInt() ?? movieId,
+    title: title,
+    description: description,
+    imageUrl: imageUrl,
+    year: year,
+    rating: rating,
+    popularity: popularity,
+    genres: const [],
+    duration: 0,
+    actors: const [],
+    releaseDate: releaseDate,
+    regionName: null,
+  );
 }
 
 // Movie Data Models
@@ -35,7 +331,13 @@ class Movie {
   final double popularity;
   final List<String> genres;
   final int duration; // in minutes
+  final int? durationSeconds;
+  final String? movieType;
+  final int? totalSeasons;
+  final int? totalEpisodes;
   final List<Actor> actors;
+  final DateTime? releaseDate;
+  final String? regionName;
 
   Movie({
     required this.id,
@@ -47,16 +349,44 @@ class Movie {
     required this.popularity,
     required this.genres,
     required this.duration,
+    this.durationSeconds,
+    this.movieType,
+    this.totalSeasons,
+    this.totalEpisodes,
     required this.actors,
+    this.releaseDate,
+    this.regionName,
   });
+
+  bool get isSeries {
+    final t = (movieType ?? '').toLowerCase().trim();
+    if (t == 'series' || t == 'tv' || t == 'tvshow' || t == 'tv_show')
+      return true;
+    if ((totalSeasons ?? 0) > 0) return true;
+    if ((totalEpisodes ?? 0) > 0) return true;
+    return false;
+  }
+}
+
+String _formatAny(dynamic v) {
+  if (v == null) return 'null';
+  if (v is String) return v;
+  if (v is num || v is bool) return v.toString();
+  try {
+    return jsonEncode(v);
+  } catch (_) {
+    return v.toString();
+  }
 }
 
 class Actor {
+  final int personId;
   final String name;
   final String character;
   final String? avatarUrl;
 
   const Actor({
+    required this.personId,
     required this.name,
     required this.character,
     this.avatarUrl,
@@ -106,15 +436,25 @@ class CommentDemo {
   });
 
   factory CommentDemo.fromJson(Map<String, dynamic> json) {
+    int readInt(String a, String b, String c) {
+      return (json[a] as num?)?.toInt() ??
+          (json[b] as num?)?.toInt() ??
+          (json[c] as num?)?.toInt() ??
+          0;
+    }
+
     return CommentDemo(
-      commentID: (json['commentID'] as num?)?.toInt() ?? 0,
-      movieID: (json['movieID'] as num?)?.toInt() ?? 0,
-      userID: (json['userID'] as num?)?.toInt() ?? 0,
-      userName: json['userName'] as String?,
+        commentID: readInt('commentID', 'commentId', 'id'),
+        movieID: readInt('movieID', 'movieId', 'movie'),
+        userID: readInt('userID', 'userId', 'user'),
+      userName: (json['userName'] ?? json['username'] ?? json['fullName'])
+          as String?,
       content: json['content'] as String? ?? '',
-      parentID: (json['parentID'] as num?)?.toInt(),
-      isEdited: json['isEdited'] as bool? ?? false,
-      likeCount: (json['likeCount'] as num?)?.toInt(),
+      parentID: (json['parentID'] as num?)?.toInt() ??
+          (json['parentId'] as num?)?.toInt(),
+      isEdited: (json['isEdited'] as bool?) ?? (json['edited'] as bool?) ?? false,
+      likeCount: (json['likeCount'] as num?)?.toInt() ??
+          (json['likes'] as num?)?.toInt(),
       createdAt: DateTime.tryParse(json['createdAt']?.toString() ?? '') ??
           DateTime.now(),
       updatedAt: DateTime.tryParse(json['updatedAt']?.toString() ?? '') ??
@@ -127,6 +467,18 @@ class GroupedCommentsDemo {
   final List<CommentDemo> parents;
   final Map<int, List<CommentDemo>> repliesByParent;
   GroupedCommentsDemo(this.parents, this.repliesByParent);
+}
+
+class _UserSlimLite {
+  final int userId;
+  final String userName;
+  final String? avatar;
+
+  const _UserSlimLite({
+    required this.userId,
+    required this.userName,
+    this.avatar,
+  });
 }
 
 class FlixGoApp extends StatelessWidget {
@@ -144,6 +496,34 @@ class FlixGoApp extends StatelessWidget {
 }
 
 final GoRouter _router = GoRouter(
+  redirect: (context, state) {
+    final path = state.uri.path;
+    final hasToken =
+        (StorageService.getUserToken()?.trim().isNotEmpty ?? false);
+    final loggedIn = isLoggedIn.value || hasToken;
+
+    const publicPaths = <String>{
+      '/',
+      '/signin',
+      '/signup',
+      '/search',
+      '/forgot-password',
+      '/check-email',
+      '/verify-email',
+    };
+
+    final isMovieDetails = path.startsWith('/movie/');
+
+    if (!loggedIn && !publicPaths.contains(path) && !isMovieDetails) {
+      return '/signin';
+    }
+
+    if (loggedIn && (path == '/signin' || path == '/signup')) {
+      return '/';
+    }
+
+    return null;
+  },
   routes: [
     GoRoute(
       path: '/',
@@ -154,9 +534,17 @@ final GoRouter _router = GoRouter(
       builder: (context, state) {
         final movieId = int.parse(state.pathParameters['id']!);
         final matches = appMovies.where((m) => m.id == movieId).toList();
-        return matches.isNotEmpty
-            ? MovieDetailsScreen(movie: matches.first)
-            : const HomeScreen();
+        return MovieDetailsScreen(
+          movieId: movieId,
+          initialMovie: matches.isNotEmpty ? matches.first : null,
+        );
+      },
+    ),
+    GoRoute(
+      path: '/actor/:id',
+      builder: (context, state) {
+        final actorId = int.parse(state.pathParameters['id']!);
+        return ActorDetailsScreen(actorId: actorId);
       },
     ),
     GoRoute(
@@ -172,6 +560,10 @@ final GoRouter _router = GoRouter(
     GoRoute(
       path: '/profile',
       builder: (context, state) => const ProfileScreen(),
+    ),
+    GoRoute(
+      path: '/moviebox',
+      builder: (context, state) => const MovieBoxScreen(),
     ),
     GoRoute(
       path: '/signin',
@@ -241,18 +633,39 @@ class _HomeScreenState extends State<HomeScreen> {
             ? (body['data'] ?? body['Data'] ?? body)
             : body;
         if (data is Map<String, dynamic>) {
+          final Map<String, dynamic>? profile = (data['profile'] is Map)
+              ? Map<String, dynamic>.from(data['profile'] as Map)
+              : null;
           final userName =
               (data['userName'] ?? data['UserName'] ?? data['name'] ?? '')
                   .toString();
           final email = (data['email'] ?? data['Email'] ?? '').toString();
           final userId =
               (data['userID'] ?? data['UserID'] ?? data['id'])?.toString();
+          final firstName =
+              (data['firstName'] ?? profile?['firstName'] ?? '').toString();
+          final lastName =
+              (data['lastName'] ?? profile?['lastName'] ?? '').toString();
+          final avatar = (data['avatar'] ?? profile?['avatar'] ?? '').toString();
+          final gender = (data['gender'] ?? profile?['gender'] ?? '').toString();
+          final dateOfBirth =
+              (data['dateOfBirth'] ?? profile?['dateOfBirth'] ?? '').toString();
           currentUserInfo.value = {
             'userName': userName,
             'email': email,
             if (userId != null) 'userID': userId,
+            if (firstName.isNotEmpty) 'firstName': firstName,
+            if (lastName.isNotEmpty) 'lastName': lastName,
+            if (avatar.isNotEmpty) 'avatar': avatar,
+            if (gender.isNotEmpty) 'gender': gender,
+            if (dateOfBirth.isNotEmpty) 'dateOfBirth': dateOfBirth,
           };
+          if (avatar.isNotEmpty) {
+            avatarCacheBuster.value =
+                DateTime.now().millisecondsSinceEpoch.toString();
+          }
           isLoggedIn.value = true;
+          unawaited(refreshSavedMoviesForCurrentUser());
         }
       }
     } catch (_) {
@@ -267,6 +680,9 @@ class _HomeScreenState extends State<HomeScreen> {
 
   // Dynamic genres populated from API tags
   List<String> availableGenres = ['All'];
+  final Map<String, int> _genreNameToTagId = {};
+  final Map<int, String> _tagIdToGenreName = {};
+  Set<int>? _activeGenreMovieIds;
 
   void _filterMovies(String query) {
     setState(() {
@@ -274,28 +690,74 @@ class _HomeScreenState extends State<HomeScreen> {
         final matchesQuery =
             movie.title.toLowerCase().contains(query.toLowerCase()) ||
                 movie.description.toLowerCase().contains(query.toLowerCase());
-        final matchesGenre =
-            selectedGenre == 'All' || movie.genres.contains(selectedGenre);
+        final matchesGenre = selectedGenre == 'All' ||
+            _activeGenreMovieIds == null ||
+            _activeGenreMovieIds!.contains(movie.id);
         return matchesQuery && matchesGenre;
       }).toList();
     });
   }
 
   void _selectGenre(String genre) {
+    if (genre == selectedGenre) return;
     setState(() {
       selectedGenre = genre;
     });
-    _filterMovies(_searchController.text);
+    _applyGenreFilter(genre);
+  }
+
+  Future<void> _applyGenreFilter(String genre) async {
+    final query = _searchController.text;
+    if (genre == 'All') {
+      _activeGenreMovieIds = null;
+      _filterMovies(query);
+      return;
+    }
+
+    final tagId = _genreNameToTagId[genre];
+    if (tagId == null) {
+      _filterMovies(query);
+      return;
+    }
+
+    setState(() {
+      _isLoading = true;
+    });
+
+    try {
+      final ids = await _fetchMovieIdsForTag(tagId);
+      _activeGenreMovieIds = ids;
+      final subset = appMovies.where((m) => ids.contains(m.id)).where((m) {
+        final q = query.toLowerCase();
+        return m.title.toLowerCase().contains(q) ||
+            m.description.toLowerCase().contains(q);
+      }).toList();
+      if (!mounted) return;
+      setState(() {
+        filteredMovies = subset;
+        _isLoading = false;
+      });
+    } catch (_) {
+      if (!mounted) return;
+      setState(() {
+        _isLoading = false;
+      });
+      _filterMovies(query);
+    }
   }
 
   Future<void> _fetchAllMovies() async {
     try {
       final url = Uri.parse(
           '${AppConstants.baseApiUrl}/api/Movie/GetAllMoviesMainScreen/mainScreen');
-      final res = await http.get(url);
+      final res = await _httpClient.get(url, headers: _authHeaders());
       if (res.statusCode == 200) {
-        final body = jsonDecode(res.body) as Map<String, dynamic>;
-        final List<dynamic> items = body['data'] as List<dynamic>;
+        final decoded = jsonDecode(res.body);
+        final data = _unwrapResponseData(decoded);
+        if (data is! List) {
+          throw Exception('mainScreen returned unexpected shape');
+        }
+        final List<dynamic> items = data;
         final fetched = items.map((e) {
           final m = e as Map<String, dynamic>;
           return Movie(
@@ -312,58 +774,50 @@ class _HomeScreenState extends State<HomeScreen> {
             // Temporary; replaced with real tag genres below
             genres: const [],
             duration: 0,
+            durationSeconds: null,
+            movieType: null,
+            totalSeasons: null,
+            totalEpisodes: null,
             actors: const [],
+            releaseDate: null,
+            regionName: null,
           );
         }).toList();
 
-        // Fetch tags and movies-per-tag, then assign genres to each movie
+        // Fetch tags (genres) for the home filter bar.
+        // Filtering will use GetMoviesByTagIDs/getMovieByTagID on demand.
         final allTags = await _fetchAllTags();
-        final tagIdToName = <int, String>{
-          for (final t in allTags)
-            ((t['tagID'] as num).toInt()): (t['tagName']?.toString() ?? '')
-        };
-        final Map<int, Set<int>> tagToMovieIds = {};
-        await Future.wait(tagIdToName.keys.map((tagId) async {
-          final ids = await _fetchMovieIdsForTag(tagId);
-          tagToMovieIds[tagId] = ids;
-        }));
-
-        final updated = fetched.map((mv) {
-          final gNames = <String>[];
-          tagToMovieIds.forEach((tagId, ids) {
-            if (ids.contains(mv.id)) {
-              final name = tagIdToName[tagId];
-              if (name != null && name.isNotEmpty) gNames.add(name);
-            }
-          });
-          gNames.sort((a, b) => a.toLowerCase().compareTo(b.toLowerCase()));
-          return Movie(
-            id: mv.id,
-            title: mv.title,
-            description: mv.description,
-            imageUrl: mv.imageUrl,
-            year: mv.year,
-            rating: mv.rating,
-            popularity: mv.popularity,
-            genres: gNames,
-            duration: mv.duration,
-            actors: mv.actors,
-          );
-        }).toList();
-
-        final names = tagIdToName.values
-            .where((n) => n.trim().isNotEmpty)
-            .map((n) => n.trim())
-            .toSet()
-            .toList()
+        final tagIdToName = <int, String>{};
+        for (final t in allTags) {
+          final id = (t['tagID'] as num?)?.toInt();
+          final name = t['tagName']?.toString().trim() ?? '';
+          if (id == null || name.isEmpty) continue;
+          tagIdToName[id] = name;
+        }
+        final names = tagIdToName.values.toSet().toList()
           ..sort((a, b) => a.toLowerCase().compareTo(b.toLowerCase()));
+
+        _genreNameToTagId
+          ..clear()
+          ..addAll({
+            for (final entry in tagIdToName.entries) entry.value: entry.key,
+          });
+        _tagIdToGenreName
+          ..clear()
+          ..addAll({
+            for (final entry in tagIdToName.entries) entry.key: entry.value,
+          });
 
         setState(() {
           availableGenres = ['All', ...names];
-          appMovies = updated;
-          filteredMovies = updated;
+          appMovies = fetched;
+          filteredMovies = fetched;
           _isLoading = false;
         });
+
+        // Enrich home cards with watchNow fields (year/rating/duration/popularity)
+        // because mainScreen doesn't include them.
+        unawaited(_enrichMoviesFromWatchNow());
       } else {
         setState(() {
           _isLoading = false;
@@ -376,16 +830,117 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
+  Future<void> _enrichMoviesFromWatchNow() async {
+    if (appMovies.isEmpty) return;
+
+    // Fetch sequentially to avoid spamming the API.
+    final updated = <Movie>[];
+    for (final movie in appMovies) {
+      try {
+        Map<String, dynamic>? data;
+
+        final watchNowUri = Uri.parse(
+            '${AppConstants.baseApiUrl}/api/Movie/GetWatchNowMovieByID/watchNow/${movie.id}');
+        final watchNowRes =
+            await _httpClient.get(watchNowUri, headers: _authHeaders());
+        if (watchNowRes.statusCode == 200) {
+          final decoded = jsonDecode(watchNowRes.body);
+          final unwrapped = _unwrapResponseData(decoded);
+          if (unwrapped is Map<String, dynamic>) {
+            data = unwrapped;
+          }
+        } else if (watchNowRes.statusCode == 401 ||
+            watchNowRes.statusCode == 403) {
+          // Guest/expired auth: fall back to anonymous basic endpoint.
+          final basicUri = Uri.parse(
+              '${AppConstants.baseApiUrl}/api/Movie/GetMovieById/${movie.id}');
+          final basicRes =
+              await _httpClient.get(basicUri, headers: _authHeaders());
+          if (basicRes.statusCode == 200) {
+            final decoded = jsonDecode(basicRes.body);
+            final unwrapped = _unwrapResponseData(decoded);
+            if (unwrapped is Map<String, dynamic>) {
+              data = unwrapped;
+            }
+          }
+        }
+
+        if (data == null) {
+          updated.add(movie);
+          continue;
+        }
+
+        final releaseDate =
+            DateTime.tryParse(data['releaseDate']?.toString() ?? '');
+        final yearInt = (data['year'] as num?)?.toInt();
+        final year = (yearInt != null && yearInt > 0)
+            ? yearInt.toString()
+            : (releaseDate != null ? releaseDate.year.toString() : movie.year);
+
+        final rated = (data['rated'] as String?)?.trim();
+        final rating =
+            (rated != null && rated.isNotEmpty) ? rated : movie.rating;
+
+        final popularity =
+            (data['popularity'] as num?)?.toDouble() ?? movie.popularity;
+
+        final durationSeconds = (data['durationSeconds'] as num?)?.toInt();
+        final durationMinutes = durationSeconds == null
+            ? movie.duration
+            : (durationSeconds / 60.0).round();
+
+        // Region might be returned as { region: { regionName } } or { regions: { regionName } }
+        final region = data['region'] ?? data['regions'];
+        final regionName = region is Map<String, dynamic>
+            ? (region['regionName'] as String?)
+            : movie.regionName;
+
+        updated.add(Movie(
+          id: movie.id,
+          title: (data['title'] as String?) ?? movie.title,
+          description: (data['description'] as String?) ?? movie.description,
+          imageUrl: (data['image'] as String?) ?? movie.imageUrl,
+          year: year,
+          rating: rating,
+          popularity: popularity,
+          genres: movie.genres,
+          duration: durationMinutes,
+          durationSeconds: durationSeconds ?? movie.durationSeconds,
+          movieType: (data['movieType'] as String?) ?? movie.movieType,
+          totalSeasons:
+              (data['totalSeasons'] as num?)?.toInt() ?? movie.totalSeasons,
+          totalEpisodes:
+              (data['totalEpisodes'] as num?)?.toInt() ?? movie.totalEpisodes,
+          actors: movie.actors,
+          releaseDate: releaseDate ?? movie.releaseDate,
+          regionName: regionName,
+        ));
+      } catch (_) {
+        updated.add(movie);
+      }
+    }
+
+    if (!mounted) return;
+    setState(() {
+      appMovies = updated;
+    });
+
+    // Re-apply current filters so the UI updates.
+    if (selectedGenre == 'All') {
+      _filterMovies(_searchController.text);
+    } else {
+      unawaited(_applyGenreFilter(selectedGenre));
+    }
+  }
+
   // Fetch all tags (genres) from API
   Future<List<Map<String, dynamic>>> _fetchAllTags() async {
     final uri =
         Uri.parse('${AppConstants.baseApiUrl}/movie/Tag/GetAllTags/getALlTags');
-    final res = await http.get(uri);
+    final res = await _httpClient.get(uri, headers: _authHeaders());
     if (res.statusCode != 200) return const [];
     final body = jsonDecode(res.body);
-    final data = body is Map<String, dynamic>
-        ? (body['data'] ?? body['Data'] ?? body)
-        : body;
+    final data = _unwrapResponseData(body);
     if (data is List) {
       return data.whereType<Map<String, dynamic>>().toList();
     }
@@ -397,12 +952,10 @@ class _HomeScreenState extends State<HomeScreen> {
     try {
       final uri = Uri.parse(
           '${AppConstants.baseApiUrl}/movie/MovieTag/GetMoviesByTagIDs/getMovieByTagID?tagID=$tagId');
-      final res = await http.get(uri);
+      final res = await _httpClient.get(uri, headers: _authHeaders());
       if (res.statusCode != 200) return <int>{};
       final body = jsonDecode(res.body);
-      final data = body is Map<String, dynamic>
-          ? (body['data'] ?? body['Data'] ?? body)
-          : body;
+      final data = _unwrapResponseData(body);
       final out = <int>{};
       if (data is List) {
         for (final item in data) {
@@ -493,14 +1046,40 @@ class _HomeScreenState extends State<HomeScreen> {
                         valueListenable: isLoggedIn,
                         builder: (context, loggedIn, _) {
                           if (loggedIn) {
-                            return GestureDetector(
-                              onTap: () => context.go('/profile'),
-                              child: const CircleAvatar(
-                                backgroundColor: Colors.red,
-                                radius: 18,
-                                child: Icon(Icons.person,
-                                    color: Colors.white, size: 18),
-                              ),
+                            return Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                IconButton(
+                                  tooltip: 'MovieBox',
+                                  onPressed: () => context.go('/moviebox'),
+                                  icon: const Icon(Icons.bookmark_border,
+                                      color: Colors.white),
+                                ),
+                                const SizedBox(width: 2),
+                                GestureDetector(
+                                  onTap: () => context.go('/profile'),
+                                  child: ValueListenableBuilder<Map<String, String>?>(
+                                    valueListenable: currentUserInfo,
+                                    builder: (context, info, _) {
+                                      final avatarUrl = cacheBustUrl(
+                                        resolveApiUrl(info?['avatar']),
+                                        cacheKey: avatarCacheBuster.value,
+                                      );
+                                      final name = (info?['userName'] ?? '').toString();
+                                      return CircleAvatar(
+                                        backgroundColor: Colors.red,
+                                        radius: 18,
+                                        backgroundImage:
+                                            avatarUrl.isNotEmpty ? NetworkImage(avatarUrl) : null,
+                                        child: avatarUrl.isNotEmpty
+                                            ? null
+                                            : Icon(Icons.person,
+                                                color: Colors.white, size: 18),
+                                      );
+                                    },
+                                  ),
+                                ),
+                              ],
                             );
                           }
                           return Row(
@@ -856,17 +1435,530 @@ class _HomeScreenState extends State<HomeScreen> {
 }
 
 // Movie Details Screen
-class MovieDetailsScreen extends StatelessWidget {
-  final Movie movie;
+class MovieDetailsScreen extends StatefulWidget {
+  final int movieId;
+  final Movie? initialMovie;
 
-  const MovieDetailsScreen({super.key, required this.movie});
+  const MovieDetailsScreen({
+    super.key,
+    required this.movieId,
+    required this.initialMovie,
+  });
+
+  @override
+  State<MovieDetailsScreen> createState() => _MovieDetailsScreenState();
+}
+
+class _MovieDetailsScreenState extends State<MovieDetailsScreen> {
+  Movie? _movie;
+  bool _loading = true;
+  String? _error;
+
+  bool _episodesLoading = false;
+  String? _episodesError;
+  int? _episodesForMovieId;
+  List<Map<String, dynamic>> _episodes = const [];
+  int? _selectedSeason;
+  Future<void>? _episodesLoadTask;
+
+    int? _firstEpisodeIdFromLoaded() {
+    if (_episodes.isEmpty) return null;
+      final withSeason = _episodes.where((e) {
+        final season = (e['seasonNumber'] as num?)?.toInt() ??
+          (e['season'] as num?)?.toInt() ??
+          0;
+        return season > 0;
+      }).toList();
+      final source = withSeason.isNotEmpty ? withSeason : _episodes;
+      final sorted = List<Map<String, dynamic>>.from(source);
+    sorted.sort((a, b) {
+        final saRaw = (a['seasonNumber'] as num?)?.toInt() ??
+          (a['season'] as num?)?.toInt() ??
+          0;
+        final sbRaw = (b['seasonNumber'] as num?)?.toInt() ??
+          (b['season'] as num?)?.toInt() ??
+          0;
+        final sa = saRaw > 0 ? saRaw : 999;
+        final sb = sbRaw > 0 ? sbRaw : 999;
+      if (sa != sb) return sa.compareTo(sb);
+
+        final eaRaw = (a['episodeNumber'] as num?)?.toInt() ??
+          (a['episode'] as num?)?.toInt() ??
+          0;
+        final ebRaw = (b['episodeNumber'] as num?)?.toInt() ??
+          (b['episode'] as num?)?.toInt() ??
+          0;
+        final ea = eaRaw > 0 ? eaRaw : 999;
+        final eb = ebRaw > 0 ? ebRaw : 999;
+      if (ea != eb) return ea.compareTo(eb);
+
+      final ia = (a['episodeID'] as num?)?.toInt() ??
+        (a['episodeId'] as num?)?.toInt() ??
+        (a['id'] as num?)?.toInt() ??
+        0;
+      final ib = (b['episodeID'] as num?)?.toInt() ??
+        (b['episodeId'] as num?)?.toInt() ??
+        (b['id'] as num?)?.toInt() ??
+        0;
+      return ia.compareTo(ib);
+    });
+
+    final first = sorted.first;
+    final id = (first['episodeID'] as num?)?.toInt() ??
+      (first['episodeId'] as num?)?.toInt() ??
+      (first['id'] as num?)?.toInt() ??
+      0;
+    return id > 0 ? id : null;
+    }
+
+  @override
+  void initState() {
+    super.initState();
+    _movie = widget.initialMovie;
+    _load();
+  }
+
+  Future<void> _load() async {
+    setState(() {
+      _loading = true;
+      _error = null;
+    });
+
+    try {
+      // Prefer watchNow (richer data) when authenticated.
+      // If the backend returns 401/403 (guest/expired auth), fall back to the
+      // anonymous basic endpoint so all users can see movie details.
+      final watchNow = await _fetchWatchNowMovie(widget.movieId);
+      final core = watchNow ?? await _fetchBasicMovieById(widget.movieId);
+
+      final results = await Future.wait([
+        _fetchTagsByMovie(widget.movieId),
+        _fetchUserRatingLabel(widget.movieId),
+      ]);
+
+      final tags = results[0] as List<String>;
+      final userRatingLabel = results[1] as String;
+
+      final merged = Movie(
+        id: core.id,
+        title: core.title,
+        description: core.description,
+        imageUrl: core.imageUrl,
+        year: core.year,
+        rating: userRatingLabel.isNotEmpty ? userRatingLabel : core.rating,
+        popularity: core.popularity,
+        genres: tags.isNotEmpty ? tags : core.genres,
+        duration: core.duration,
+        durationSeconds: core.durationSeconds,
+        movieType: core.movieType,
+        totalSeasons: core.totalSeasons,
+        totalEpisodes: core.totalEpisodes,
+        actors: core.actors,
+        releaseDate: core.releaseDate,
+        regionName: core.regionName,
+      );
+
+      if (!mounted) return;
+      setState(() {
+        _movie = merged;
+        _loading = false;
+      });
+
+      if (merged.isSeries) {
+        unawaited(_loadEpisodes(merged.id));
+      } else {
+        if (!mounted) return;
+        setState(() {
+          _episodesForMovieId = merged.id;
+          _episodes = const [];
+          _episodesError = null;
+          _episodesLoading = false;
+        });
+      }
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _loading = false;
+        _error = e.toString();
+      });
+    }
+  }
+
+  Future<void> _loadEpisodes(int movieId) async {
+    if (_episodesForMovieId == movieId) {
+      if (_episodesLoading && _episodesLoadTask != null) {
+        await _episodesLoadTask;
+        return;
+      }
+      if (_episodes.isNotEmpty || _episodesError != null) return;
+    }
+
+    final completer = Completer<void>();
+    _episodesLoadTask = completer.future;
+
+    setState(() {
+      _episodesLoading = true;
+      _episodesError = null;
+      _episodesForMovieId = movieId;
+      _episodes = const [];
+    });
+    try {
+      final uri = Uri.parse(
+          '${AppConstants.baseApiUrl}/api/Episode/GetEpisodesByMovieId/getbyMovie/$movieId');
+      final res = await _httpClient.get(uri, headers: _authHeaders());
+      if (res.statusCode != 200) {
+        throw Exception(
+            'Episodes HTTP ${res.statusCode}: ${_previewBody(res.body)}');
+      }
+      final decoded = jsonDecode(res.body);
+      final data = _unwrapResponseData(decoded);
+      if (data is! List) {
+        throw Exception('Episodes returned unexpected shape');
+      }
+      final eps = <Map<String, dynamic>>[];
+      for (final e in data) {
+        if (e is Map<String, dynamic>) {
+          eps.add(e);
+        } else if (e is Map) {
+          eps.add(Map<String, dynamic>.from(e as Map));
+        }
+      }
+      if (!mounted) return;
+      setState(() {
+        _episodes = eps;
+        final seasons = eps
+            .map((e) =>
+                (e['seasonNumber'] as num?)?.toInt() ??
+                (e['season'] as num?)?.toInt() ??
+                0)
+            .where((s) => s > 0)
+            .toSet()
+            .toList()
+          ..sort();
+        if (seasons.isNotEmpty &&
+            (_selectedSeason == null || !seasons.contains(_selectedSeason))) {
+          _selectedSeason = seasons.first;
+        }
+        _episodesLoading = false;
+      });
+      completer.complete();
+    } catch (e) {
+      if (mounted) {
+        setState(() {
+          _episodesLoading = false;
+          _episodesError = e.toString();
+        });
+      }
+      completer.complete();
+    } finally {
+      _episodesLoadTask = null;
+    }
+  }
+
+  Future<Movie?> _fetchWatchNowMovie(int movieId) async {
+    final uri = Uri.parse(
+        '${AppConstants.baseApiUrl}/api/Movie/GetWatchNowMovieByID/watchNow/$movieId');
+    final res = await _httpClient.get(uri, headers: _authHeaders());
+    if (res.statusCode == 401 || res.statusCode == 403) {
+      return null;
+    }
+    if (res.statusCode != 200) {
+      throw Exception(
+          'watchNow HTTP ${res.statusCode}: ${_previewBody(res.body)}');
+    }
+
+    final body = jsonDecode(res.body);
+    final data = _unwrapResponseData(body);
+    if (data is! Map<String, dynamic>) {
+      throw Exception('Unexpected response shape');
+    }
+
+    final title = (data['title'] as String?) ??
+        (data['originalTitle'] as String?) ??
+        'Untitled';
+    final description = (data['description'] as String?) ?? '';
+    final imageUrl = (data['image'] as String?) ??
+        'https://via.placeholder.com/300x400?text=No+Image';
+
+    final releaseDate =
+        DateTime.tryParse(data['releaseDate']?.toString() ?? '');
+    final yearInt = (data['year'] as num?)?.toInt();
+    final year = (yearInt != null && yearInt > 0)
+        ? yearInt.toString()
+        : (releaseDate != null ? releaseDate.year.toString() : '—');
+
+    final rating = (data['rated'] as String?)?.trim().isNotEmpty == true
+        ? (data['rated'] as String)
+        : 'NR';
+
+    final popularity = (data['popularity'] as num?)?.toDouble() ?? 0.0;
+
+    final durationSeconds = (data['durationSeconds'] as num?)?.toInt();
+    final durationMinutes =
+        durationSeconds == null ? 0 : (durationSeconds / 60.0).round();
+
+    final region = data['region'];
+    final regionName = region is Map<String, dynamic>
+        ? (region['regionName'] as String?)
+        : null;
+
+    final tags = data['tags'];
+    final genres = <String>[];
+    if (tags is List) {
+      for (final t in tags) {
+        if (t is Map<String, dynamic>) {
+          final name = (t['tagName'] as String?)?.trim();
+          if (name != null && name.isNotEmpty) genres.add(name);
+        }
+      }
+    }
+    genres.sort((a, b) => a.toLowerCase().compareTo(b.toLowerCase()));
+
+    final actorsRaw = data['actors'];
+    final actors = <Actor>[];
+    if (actorsRaw is List) {
+      for (final a in actorsRaw) {
+        if (a is Map<String, dynamic>) {
+          final personId = (a['personID'] as num?)?.toInt() ??
+              (a['personId'] as num?)?.toInt() ??
+              (a['id'] as num?)?.toInt() ??
+              0;
+          final fullName = (a['fullName'] as String?)?.trim();
+          if (fullName == null || fullName.isEmpty) continue;
+          final character = (a['characterName'] as String?)?.trim() ??
+              (a['role'] as String?)?.trim() ??
+              '';
+          actors.add(Actor(
+            personId: personId,
+            name: fullName,
+            character: character,
+            avatarUrl: a['avatar'] as String?,
+          ));
+        }
+      }
+    }
+
+    return Movie(
+      id: (data['movieID'] as num?)?.toInt() ?? movieId,
+      title: title,
+      description: description,
+      imageUrl: imageUrl,
+      year: year,
+      rating: rating,
+      popularity: popularity,
+      genres: genres,
+      duration: durationMinutes,
+      durationSeconds: durationSeconds,
+      movieType: (data['movieType'] as String?),
+      totalSeasons: (data['totalSeasons'] as num?)?.toInt(),
+      totalEpisodes: (data['totalEpisodes'] as num?)?.toInt(),
+      actors: actors,
+      releaseDate: releaseDate,
+      regionName: regionName,
+    );
+  }
+
+  Future<Movie> _fetchBasicMovieById(int movieId) async {
+    final uri =
+        Uri.parse('${AppConstants.baseApiUrl}/api/Movie/GetMovieById/$movieId');
+    final res = await _httpClient.get(uri, headers: _authHeaders());
+    if (res.statusCode != 200) {
+      throw Exception(
+          'GetMovieById HTTP ${res.statusCode}: ${_previewBody(res.body)}');
+    }
+
+    final body = jsonDecode(res.body);
+    final data = _unwrapResponseData(body);
+    if (data is! Map<String, dynamic>) {
+      throw Exception('Unexpected response shape');
+    }
+
+    final title = (data['title'] as String?) ??
+        (data['originalTitle'] as String?) ??
+        'Untitled';
+    final description = (data['description'] as String?) ?? '';
+    final imageUrl = (data['image'] as String?) ??
+        'https://via.placeholder.com/300x400?text=No+Image';
+
+    final releaseDate =
+        DateTime.tryParse(data['releaseDate']?.toString() ?? '');
+    final yearInt = (data['year'] as num?)?.toInt();
+    final year = (yearInt != null && yearInt > 0)
+        ? yearInt.toString()
+        : (releaseDate != null ? releaseDate.year.toString() : '—');
+
+    final rated = (data['rated'] as String?)?.trim();
+    final rating = (rated != null && rated.isNotEmpty) ? rated : 'NR';
+
+    final popularity = (data['popularity'] as num?)?.toDouble() ?? 0.0;
+
+    final durationSeconds = (data['durationSeconds'] as num?)?.toInt();
+    final durationMinutes =
+        durationSeconds == null ? 0 : (durationSeconds / 60.0).round();
+
+    // Region might be returned as { region: { regionName } } or { regions: { regionName } }
+    final region = data['region'] ?? data['regions'];
+    final regionName = region is Map<String, dynamic>
+        ? (region['regionName'] as String?)
+        : null;
+
+    // Attempt to derive genres from embedded tags if present.
+    final genres = <String>[];
+    final tags = data['tags'];
+    if (tags is List) {
+      for (final t in tags) {
+        if (t is Map<String, dynamic>) {
+          final name = (t['tagName'] as String?)?.trim();
+          if (name != null && name.isNotEmpty) genres.add(name);
+        }
+      }
+    }
+    final movieTags = data['movieTags'];
+    if (genres.isEmpty && movieTags is List) {
+      for (final mt in movieTags) {
+        if (mt is Map<String, dynamic>) {
+          final tag = mt['tags'] ?? mt['tag'];
+          if (tag is Map<String, dynamic>) {
+            final name = (tag['tagName'] as String?)?.trim();
+            if (name != null && name.isNotEmpty) genres.add(name);
+          }
+        }
+      }
+    }
+    genres.sort((a, b) => a.toLowerCase().compareTo(b.toLowerCase()));
+
+    return Movie(
+      id: (data['movieID'] as num?)?.toInt() ?? movieId,
+      title: title,
+      description: description,
+      imageUrl: imageUrl,
+      year: year,
+      rating: rating,
+      popularity: popularity,
+      genres: genres,
+      duration: durationMinutes,
+      durationSeconds: durationSeconds,
+      movieType: (data['movieType'] as String?),
+      totalSeasons: (data['totalSeasons'] as num?)?.toInt(),
+      totalEpisodes: (data['totalEpisodes'] as num?)?.toInt(),
+      actors: const [],
+      releaseDate: releaseDate,
+      regionName: regionName,
+    );
+  }
+
+  Future<List<String>> _fetchTagsByMovie(int movieId) async {
+    final uri = Uri.parse(
+        '${AppConstants.baseApiUrl}/movie/MovieTag/GetTagsByMovie/$movieId');
+    final res = await _httpClient.get(uri, headers: _authHeaders());
+    if (res.statusCode != 200) return const [];
+    final decoded = jsonDecode(res.body);
+    final data = _unwrapResponseData(decoded);
+    final out = <String>[];
+    if (data is List) {
+      for (final item in data) {
+        if (item is Map<String, dynamic>) {
+          final name = (item['tagName'] ?? item['TagName'])?.toString().trim();
+          if (name != null && name.isNotEmpty) out.add(name);
+        }
+      }
+    }
+    out.sort((a, b) => a.toLowerCase().compareTo(b.toLowerCase()));
+    return out;
+  }
+
+  Future<String> _fetchUserRatingLabel(int movieId) async {
+    final uri = Uri.parse(
+        '${AppConstants.baseApiUrl}/api/UserRating/GetAllUserRatingsByMovieId/$movieId');
+    final res = await _httpClient.get(uri, headers: _authHeaders());
+    if (res.statusCode != 200) return '';
+    final decoded = jsonDecode(res.body);
+    final data = _unwrapResponseData(decoded);
+    if (data is! List) return '';
+
+    final values = <double>[];
+    for (final item in data) {
+      if (item is Map) {
+        final dynamic v = item['ratingValue'] ??
+            item['rating'] ??
+            item['score'] ??
+            item['stars'] ??
+            item['point'] ??
+            item['value'];
+        if (v is num) {
+          values.add(v.toDouble());
+        } else if (v is String) {
+          final parsed = double.tryParse(v);
+          if (parsed != null) values.add(parsed);
+        }
+      }
+    }
+    if (values.isEmpty) return '';
+    final avg = values.reduce((a, b) => a + b) / values.length;
+    return '⭐ ${avg.toStringAsFixed(1)}';
+  }
 
   @override
   Widget build(BuildContext context) {
+    if (_loading && _movie == null) {
+      return const Scaffold(
+        backgroundColor: Colors.black,
+        body: Center(child: CircularProgressIndicator()),
+      );
+    }
+
+    if (_error != null && _movie == null) {
+      return Scaffold(
+        backgroundColor: Colors.black,
+        body: Center(
+          child: Padding(
+            padding: const EdgeInsets.all(24),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const Text(
+                  'Failed to load movie details',
+                  style: TextStyle(color: Colors.white, fontSize: 18),
+                ),
+                const SizedBox(height: 8),
+                Text(
+                  _error!,
+                  textAlign: TextAlign.center,
+                  style: const TextStyle(color: Colors.white70),
+                ),
+                const SizedBox(height: 16),
+                ElevatedButton(
+                  onPressed: () => context.go('/'),
+                  child: const Text('Back'),
+                ),
+              ],
+            ),
+          ),
+        ),
+      );
+    }
+
+    final movie = _movie!;
+    final durationSec = movie.durationSeconds ??
+        (movie.duration > 0 ? movie.duration * 60 : null);
+
     return Scaffold(
       backgroundColor: Colors.black,
       body: CustomScrollView(
         slivers: [
+          if (_error != null)
+            SliverToBoxAdapter(
+              child: Container(
+                width: double.infinity,
+                color: Colors.red.withOpacity(0.12),
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+                child: Text(
+                  'Details load failed: $_error',
+                  style: const TextStyle(color: Colors.redAccent),
+                ),
+              ),
+            ),
           SliverAppBar(
             expandedHeight: 420,
             floating: false,
@@ -931,7 +2023,16 @@ class MovieDetailsScreen extends StatelessWidget {
                         children: [
                           _MetaChip(label: movie.year),
                           _MetaChip(label: movie.rating),
-                          _MetaChip(label: '${movie.duration} min'),
+                          _MetaChip(
+                              label: durationSec == null
+                                  ? '— sec'
+                                  : '$durationSec sec'),
+                          if (movie.releaseDate != null)
+                            _MetaChip(
+                                label: DateFormat('yyyy-MM-dd')
+                                    .format(movie.releaseDate!)),
+                          if ((movie.regionName ?? '').trim().isNotEmpty)
+                            _MetaChip(label: movie.regionName!.trim()),
                           Row(
                             mainAxisSize: MainAxisSize.min,
                             children: [
@@ -958,34 +2059,199 @@ class MovieDetailsScreen extends StatelessWidget {
                                       CrossAxisAlignment.stretch,
                                   children: [
                                     _PlayButton(onTap: () {
-                                      showDialog(
-                                        context: context,
-                                        barrierDismissible: true,
-                                        builder: (_) => InlinePlayerDialogDemo(
-                                            movieId: movie.id),
-                                      );
+                                      () async {
+                                        if (movie.isSeries) {
+                                          await _loadEpisodes(movie.id);
+                                          final firstEpId =
+                                              _firstEpisodeIdFromLoaded();
+                                          if (firstEpId != null) {
+                                            if (!context.mounted) return;
+                                            showDialog(
+                                              context: context,
+                                              barrierDismissible: true,
+                                              builder: (_) =>
+                                                  InlinePlayerDialogDemo.episode(
+                                                episodeId: firstEpId,
+                                                title: 'Episode 1',
+                                              ),
+                                            );
+                                            return;
+                                          }
+                                        }
+                                        if (!context.mounted) return;
+                                        showDialog(
+                                          context: context,
+                                          barrierDismissible: true,
+                                          builder: (_) => InlinePlayerDialogDemo(
+                                              movieId: movie.id),
+                                        );
+                                      }();
                                     }),
                                     const SizedBox(height: 12),
-                                    _AddToListButton(onTap: () {}),
+                                    ValueListenableBuilder<Set<int>>(
+                                      valueListenable: savedMovieIds,
+                                      builder: (context, ids, _) {
+                                        final isSaved = ids.contains(movie.id);
+                                        return _AddToListButton(
+                                          isSaved: isSaved,
+                                          onTap: () async {
+                                            try {
+                                              if (!isLoggedIn.value) {
+                                                await showAuthzPromptDialog(
+                                                  context,
+                                                  type: AuthzPromptType.signIn,
+                                                  onPrimary: () =>
+                                                      context.go('/signin'),
+                                                );
+                                                return;
+                                              }
+                                              if (isSaved) {
+                                                await removeFromMovieBox(
+                                                    movie.id);
+                                              } else {
+                                                await addToMovieBox(movie.id);
+                                              }
+                                            } catch (e) {
+                                              if (!context.mounted) return;
+                                              final prompt =
+                                                  authzPromptFromError(e);
+                                              if (prompt ==
+                                                  AuthzPromptType.signIn) {
+                                                await showAuthzPromptDialog(
+                                                  context,
+                                                  type: AuthzPromptType.signIn,
+                                                  onPrimary: () =>
+                                                      context.go('/signin'),
+                                                );
+                                                return;
+                                              }
+                                              if (prompt ==
+                                                  AuthzPromptType.buyPlan) {
+                                                await showAuthzPromptDialog(
+                                                  context,
+                                                  type: AuthzPromptType.buyPlan,
+                                                  onPrimary: () =>
+                                                      context.go('/profile'),
+                                                );
+                                                return;
+                                              }
+
+                                              ScaffoldMessenger.of(context)
+                                                  .showSnackBar(
+                                                SnackBar(
+                                                  content: Text(isSaved
+                                                      ? 'Failed to remove from MovieBox'
+                                                      : 'Failed to save to MovieBox'),
+                                                ),
+                                              );
+                                            }
+                                          },
+                                        );
+                                      },
+                                    ),
                                   ],
                                 )
                               : Row(
                                   children: [
                                     Expanded(
                                       child: _PlayButton(onTap: () {
-                                        showDialog(
-                                          context: context,
-                                          barrierDismissible: true,
-                                          builder: (_) =>
-                                              InlinePlayerDialogDemo(
-                                                  movieId: movie.id),
-                                        );
+                                        () async {
+                                          if (movie.isSeries) {
+                                            await _loadEpisodes(movie.id);
+                                            final firstEpId =
+                                                _firstEpisodeIdFromLoaded();
+                                            if (firstEpId != null) {
+                                              if (!context.mounted) return;
+                                              showDialog(
+                                                context: context,
+                                                barrierDismissible: true,
+                                                builder: (_) =>
+                                                    InlinePlayerDialogDemo.episode(
+                                                  episodeId: firstEpId,
+                                                  title: 'Episode 1',
+                                                ),
+                                              );
+                                              return;
+                                            }
+                                          }
+                                          if (!context.mounted) return;
+                                          showDialog(
+                                            context: context,
+                                            barrierDismissible: true,
+                                            builder: (_) => InlinePlayerDialogDemo(
+                                                movieId: movie.id),
+                                          );
+                                        }();
                                       }),
                                     ),
                                     const SizedBox(width: 12),
                                     SizedBox(
                                       width: 220,
-                                      child: _AddToListButton(onTap: () {}),
+                                      child: ValueListenableBuilder<Set<int>>(
+                                        valueListenable: savedMovieIds,
+                                        builder: (context, ids, _) {
+                                          final isSaved =
+                                              ids.contains(movie.id);
+                                          return _AddToListButton(
+                                            isSaved: isSaved,
+                                            onTap: () async {
+                                              try {
+                                                if (!isLoggedIn.value) {
+                                                  await showAuthzPromptDialog(
+                                                    context,
+                                                    type: AuthzPromptType.signIn,
+                                                    onPrimary: () =>
+                                                        context.go('/signin'),
+                                                  );
+                                                  return;
+                                                }
+                                                if (isSaved) {
+                                                  await removeFromMovieBox(
+                                                      movie.id);
+                                                } else {
+                                                  await addToMovieBox(
+                                                      movie.id);
+                                                }
+                                              } catch (e) {
+                                                if (!context.mounted) return;
+                                                final prompt =
+                                                    authzPromptFromError(e);
+                                                if (prompt ==
+                                                    AuthzPromptType.signIn) {
+                                                  await showAuthzPromptDialog(
+                                                    context,
+                                                    type:
+                                                        AuthzPromptType.signIn,
+                                                    onPrimary: () =>
+                                                        context.go('/signin'),
+                                                  );
+                                                  return;
+                                                }
+                                                if (prompt ==
+                                                    AuthzPromptType.buyPlan) {
+                                                  await showAuthzPromptDialog(
+                                                    context,
+                                                    type:
+                                                        AuthzPromptType.buyPlan,
+                                                    onPrimary: () =>
+                                                        context.go('/profile'),
+                                                  );
+                                                  return;
+                                                }
+
+                                                ScaffoldMessenger.of(context)
+                                                    .showSnackBar(
+                                                  SnackBar(
+                                                    content: Text(isSaved
+                                                        ? 'Failed to remove from MovieBox'
+                                                        : 'Failed to save to MovieBox'),
+                                                  ),
+                                                );
+                                              }
+                                            },
+                                          );
+                                        },
+                                      ),
                                     ),
                                   ],
                                 );
@@ -1059,58 +2325,366 @@ class MovieDetailsScreen extends StatelessWidget {
                               const SizedBox(width: 14),
                           itemBuilder: (context, index) {
                             final actor = movie.actors[index];
-                            return SizedBox(
-                              width: 110,
-                              child: Column(
-                                children: [
-                                  Container(
-                                    width: 72,
-                                    height: 72,
-                                    decoration: BoxDecoration(
-                                      shape: BoxShape.circle,
-                                      border: Border.all(color: Colors.white24),
-                                      color: Colors.grey[850],
-                                    ),
-                                    alignment: Alignment.center,
-                                    child: Text(
-                                      actor.name[0],
-                                      style: const TextStyle(
-                                        color: Colors.white,
-                                        fontSize: 28,
-                                        fontWeight: FontWeight.bold,
+                            final canOpen = actor.personId > 0;
+                            return InkWell(
+                              onTap: canOpen
+                                  ? () =>
+                                      context.push('/actor/${actor.personId}')
+                                  : null,
+                              child: SizedBox(
+                                width: 110,
+                                child: Column(
+                                  children: [
+                                    Container(
+                                      width: 72,
+                                      height: 72,
+                                      decoration: BoxDecoration(
+                                        shape: BoxShape.circle,
+                                        border:
+                                            Border.all(color: Colors.white24),
+                                        color: Colors.grey[850],
+                                      ),
+                                      alignment: Alignment.center,
+                                      child: Text(
+                                        actor.name.isNotEmpty
+                                            ? actor.name[0]
+                                            : '?',
+                                        style: const TextStyle(
+                                          color: Colors.white,
+                                          fontSize: 28,
+                                          fontWeight: FontWeight.bold,
+                                        ),
                                       ),
                                     ),
-                                  ),
-                                  const SizedBox(height: 8),
-                                  Text(
-                                    actor.name,
-                                    textAlign: TextAlign.center,
-                                    maxLines: 2,
-                                    overflow: TextOverflow.ellipsis,
-                                    style: const TextStyle(
-                                      color: Colors.white,
-                                      fontSize: 12,
-                                      fontWeight: FontWeight.w600,
+                                    const SizedBox(height: 8),
+                                    Text(
+                                      actor.name,
+                                      textAlign: TextAlign.center,
+                                      maxLines: 2,
+                                      overflow: TextOverflow.ellipsis,
+                                      style: const TextStyle(
+                                        color: Colors.white,
+                                        fontSize: 12,
+                                        fontWeight: FontWeight.w600,
+                                      ),
                                     ),
-                                  ),
-                                  Text(
-                                    actor.character,
-                                    textAlign: TextAlign.center,
-                                    maxLines: 1,
-                                    overflow: TextOverflow.ellipsis,
-                                    style: const TextStyle(
-                                      color: Colors.white60,
-                                      fontSize: 11,
+                                    Text(
+                                      actor.character,
+                                      textAlign: TextAlign.center,
+                                      maxLines: 1,
+                                      overflow: TextOverflow.ellipsis,
+                                      style: const TextStyle(
+                                        color: Colors.white60,
+                                        fontSize: 11,
+                                      ),
                                     ),
-                                  ),
-                                ],
+                                  ],
+                                ),
                               ),
                             );
                           },
                         ),
                       ),
+                      if (movie.isSeries) ...[
+                        const SizedBox(height: 24),
+                        Row(
+                          crossAxisAlignment: CrossAxisAlignment.center,
+                          children: [
+                            const Expanded(
+                              child: Text(
+                                'Episodes',
+                                style: TextStyle(
+                                  color: Colors.white,
+                                  fontSize: 20,
+                                  fontWeight: FontWeight.w700,
+                                ),
+                              ),
+                            ),
+                            const Text(
+                              'Seasons:',
+                              style: TextStyle(
+                                color: Colors.white70,
+                                fontWeight: FontWeight.w600,
+                              ),
+                            ),
+                            const SizedBox(width: 10),
+                            Builder(
+                              builder: (context) {
+                                final seasons = _episodes
+                                    .map((e) =>
+                                        (e['seasonNumber'] as num?)?.toInt() ??
+                                        (e['season'] as num?)?.toInt() ??
+                                        0)
+                                    .where((s) => s > 0)
+                                    .toSet()
+                                    .toList()
+                                  ..sort();
+                                final selected = (seasons.isNotEmpty)
+                                    ? (_selectedSeason != null &&
+                                            seasons.contains(_selectedSeason)
+                                        ? _selectedSeason
+                                        : seasons.first)
+                                    : null;
+                                if (_selectedSeason != selected) {
+                                  WidgetsBinding.instance
+                                      .addPostFrameCallback((_) {
+                                    if (!mounted) return;
+                                    setState(() {
+                                      _selectedSeason = selected;
+                                    });
+                                  });
+                                }
+                                return Container(
+                                  padding: const EdgeInsets.symmetric(
+                                      horizontal: 12),
+                                  decoration: BoxDecoration(
+                                    color: Colors.white.withOpacity(0.06),
+                                    borderRadius: BorderRadius.circular(12),
+                                    border: Border.all(color: Colors.white12),
+                                  ),
+                                  child: DropdownButtonHideUnderline(
+                                    child: DropdownButton<int>(
+                                      dropdownColor: Colors.black87,
+                                      value: selected,
+                                      icon: const Icon(Icons.arrow_drop_down,
+                                          color: Colors.redAccent),
+                                      items: seasons
+                                          .map(
+                                            (s) => DropdownMenuItem<int>(
+                                              value: s,
+                                              child: Text(
+                                                'Season $s',
+                                                style: const TextStyle(
+                                                    color: Colors.white),
+                                              ),
+                                            ),
+                                          )
+                                          .toList(),
+                                      onChanged: seasons.isEmpty
+                                          ? null
+                                          : (v) {
+                                              setState(() {
+                                                _selectedSeason = v;
+                                              });
+                                            },
+                                    ),
+                                  ),
+                                );
+                              },
+                            ),
+                          ],
+                        ),
+                        const SizedBox(height: 14),
+                        if (_episodesLoading)
+                          const Center(
+                            child: SizedBox(
+                              height: 28,
+                              width: 28,
+                              child: CircularProgressIndicator(strokeWidth: 2),
+                            ),
+                          )
+                        else if (_episodesError != null)
+                          Text(
+                            _episodesError!,
+                            style: const TextStyle(color: Colors.white70),
+                          )
+                        else if (_episodes.isEmpty)
+                          const Text(
+                            'No episodes available',
+                            style: TextStyle(color: Colors.white70),
+                          )
+                        else
+                          ListView.separated(
+                            shrinkWrap: true,
+                            physics: const NeverScrollableScrollPhysics(),
+                            itemCount: _episodes.where((e) {
+                              final season =
+                                  (e['seasonNumber'] as num?)?.toInt() ??
+                                      (e['season'] as num?)?.toInt() ??
+                                      0;
+                              return _selectedSeason == null ||
+                                  season == _selectedSeason;
+                            }).length,
+                            separatorBuilder: (_, __) =>
+                                const SizedBox(height: 12),
+                            itemBuilder: (context, index) {
+                              final filtered = _episodes.where((e) {
+                                final season =
+                                    (e['seasonNumber'] as num?)?.toInt() ??
+                                        (e['season'] as num?)?.toInt() ??
+                                        0;
+                                return _selectedSeason == null ||
+                                    season == _selectedSeason;
+                              }).toList();
+                              final ep = filtered[index];
+                              final epId = (ep['episodeID'] as num?)?.toInt() ??
+                                  (ep['episodeId'] as num?)?.toInt() ??
+                                  (ep['id'] as num?)?.toInt() ??
+                                  0;
+                              final epTitle =
+                                  (ep['title'] as String?)?.trim().isNotEmpty ==
+                                          true
+                                      ? (ep['title'] as String)
+                                      : 'Episode $epId';
+                              final seasonNumber =
+                                  (ep['seasonNumber'] as num?)?.toInt() ??
+                                      (ep['season'] as num?)?.toInt();
+                              final episodeNumber =
+                                  (ep['episodeNumber'] as num?)?.toInt() ??
+                                      (ep['episode'] as num?)?.toInt();
+                              final synopsis =
+                                  (ep['synopsis'] as String?)?.trim();
+                              final description =
+                                  (ep['description'] as String?)?.trim() ??
+                                      (ep['overview'] as String?)?.trim();
+                              final durationSeconds =
+                                  (ep['durationSeconds'] as num?)?.toInt();
+                              final epLabel = episodeNumber != null
+                                  ? 'Episode $episodeNumber'
+                                  : (epId > 0 ? 'Episode $epId' : 'Episode');
+
+                              return InkWell(
+                                onTap: epId <= 0
+                                    ? null
+                                    : () {
+                                        showDialog(
+                                          context: context,
+                                          barrierDismissible: true,
+                                          builder: (_) =>
+                                              InlinePlayerDialogDemo.episode(
+                                            episodeId: epId,
+                                            title: epTitle,
+                                          ),
+                                        );
+                                      },
+                                child: Container(
+                                  decoration: BoxDecoration(
+                                    color: Colors.white.withOpacity(0.04),
+                                    borderRadius: BorderRadius.circular(12),
+                                    border: Border.all(color: Colors.white12),
+                                  ),
+                                  padding: const EdgeInsets.all(12),
+                                  child: Column(
+                                    crossAxisAlignment:
+                                        CrossAxisAlignment.start,
+                                    children: [
+                                      Row(
+                                        crossAxisAlignment:
+                                            CrossAxisAlignment.start,
+                                        children: [
+                                          Container(
+                                            width: 76,
+                                            height: 76,
+                                            decoration: BoxDecoration(
+                                              color:
+                                                  Colors.red.withOpacity(0.75),
+                                              borderRadius:
+                                                  BorderRadius.circular(14),
+                                            ),
+                                            alignment: Alignment.center,
+                                            child: const Icon(Icons.play_arrow,
+                                                color: Colors.white, size: 36),
+                                          ),
+                                          const SizedBox(width: 12),
+                                          Expanded(
+                                            child: Column(
+                                              crossAxisAlignment:
+                                                  CrossAxisAlignment.start,
+                                              children: [
+                                                Row(
+                                                  children: [
+                                                    Expanded(
+                                                      child: Text(
+                                                        epLabel,
+                                                        style: const TextStyle(
+                                                          color:
+                                                              Colors.redAccent,
+                                                          fontSize: 16,
+                                                          fontWeight:
+                                                              FontWeight.w800,
+                                                        ),
+                                                      ),
+                                                    ),
+                                                    Text(
+                                                      durationSeconds != null
+                                                          ? '${durationSeconds}s'
+                                                          : '—s',
+                                                      style: const TextStyle(
+                                                          color: Colors.white60,
+                                                          fontSize: 13,
+                                                          fontWeight:
+                                                              FontWeight.w600),
+                                                    ),
+                                                  ],
+                                                ),
+                                                const SizedBox(height: 6),
+                                                Text(
+                                                  epTitle,
+                                                  maxLines: 1,
+                                                  overflow:
+                                                      TextOverflow.ellipsis,
+                                                  style: const TextStyle(
+                                                    color: Colors.white,
+                                                    fontSize: 16,
+                                                    fontWeight: FontWeight.w700,
+                                                  ),
+                                                ),
+                                                if (synopsis != null &&
+                                                    synopsis.isNotEmpty) ...[
+                                                  const SizedBox(height: 4),
+                                                  Text(
+                                                    synopsis,
+                                                    maxLines: 1,
+                                                    overflow:
+                                                        TextOverflow.ellipsis,
+                                                    style: const TextStyle(
+                                                        color: Colors.white70,
+                                                        fontSize: 13),
+                                                  ),
+                                                ],
+                                                if (description != null &&
+                                                    description.isNotEmpty) ...[
+                                                  const SizedBox(height: 4),
+                                                  Text(
+                                                    description,
+                                                    maxLines: 1,
+                                                    overflow:
+                                                        TextOverflow.ellipsis,
+                                                    style: const TextStyle(
+                                                        color: Colors.white60,
+                                                        fontSize: 13),
+                                                  ),
+                                                ],
+                                                if (seasonNumber != null &&
+                                                    episodeNumber != null) ...[
+                                                  const SizedBox(height: 4),
+                                                  Text(
+                                                    'Season $seasonNumber • Episode $episodeNumber',
+                                                    style: const TextStyle(
+                                                        color: Colors.white38,
+                                                        fontSize: 12),
+                                                  ),
+                                                ],
+                                              ],
+                                            ),
+                                          ),
+                                          const SizedBox(width: 8),
+                                          const Icon(Icons.chevron_right,
+                                              color: Colors.white54),
+                                        ],
+                                      ),
+                                    ],
+                                  ),
+                                ),
+                              );
+                            },
+                          ),
+                      ],
                       const SizedBox(height: 24),
                       const Divider(color: Color(0x22FFFFFF)),
+                      const SizedBox(height: 20),
+                      // Rating (logged-in only; plan required to rate)
+                      _UserRatingSectionDemo(movieId: movie.id),
                       const SizedBox(height: 20),
                       // Comments (API-driven, replies supported)
                       CommentsDemoWidget(movieId: movie.id),
@@ -1171,7 +2745,8 @@ class _PlayButton extends StatelessWidget {
 
 class _AddToListButton extends StatelessWidget {
   final VoidCallback onTap;
-  const _AddToListButton({required this.onTap});
+  final bool isSaved;
+  const _AddToListButton({required this.onTap, required this.isSaved});
 
   @override
   Widget build(BuildContext context) {
@@ -1183,8 +2758,353 @@ class _AddToListButton extends StatelessWidget {
         padding: const EdgeInsets.symmetric(vertical: 16, horizontal: 16),
         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
       ),
-      icon: const Icon(Icons.add),
-      label: const Text('My List', style: TextStyle(fontSize: 15)),
+      icon: Icon(isSaved ? Icons.check : Icons.add),
+      label: Text(isSaved ? 'Saved' : 'My List',
+          style: const TextStyle(fontSize: 15)),
+    );
+  }
+}
+
+class _UserRatingSectionDemo extends StatefulWidget {
+  final int movieId;
+  const _UserRatingSectionDemo({required this.movieId});
+
+  @override
+  State<_UserRatingSectionDemo> createState() => _UserRatingSectionDemoState();
+}
+
+class _UserRatingSectionDemoState extends State<_UserRatingSectionDemo> {
+  bool _loading = false;
+  bool _submitting = false;
+  bool _hasPlan = false;
+  int _myStars = 0;
+  int? _myUserRatingId;
+  double _avg = 0;
+  int _count = 0;
+  String? _error;
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  @override
+  void didUpdateWidget(covariant _UserRatingSectionDemo oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.movieId != widget.movieId) {
+      _load();
+    }
+  }
+
+  Future<void> _load() async {
+    if (!(isLoggedIn.value == true) || currentUserInfo.value == null) {
+      return;
+    }
+
+    setState(() {
+      _loading = true;
+      _error = null;
+    });
+
+    try {
+      final info = currentUserInfo.value ?? {};
+      final userIdStr = info['userID'];
+      final userId = userIdStr != null ? int.tryParse(userIdStr) : null;
+      if (userId == null || userId <= 0) {
+        setState(() {
+          _loading = false;
+        });
+        return;
+      }
+
+      // Subscription
+      bool hasPlan = false;
+      try {
+        final subsRes = await http.get(
+          Uri.parse(
+              '${AppConstants.baseApiUrl}/api/payment/subscription/user/$userId'),
+          headers: _authHeaders(),
+        );
+        if (subsRes.statusCode >= 200 && subsRes.statusCode < 300) {
+          final body = json.decode(subsRes.body);
+          final data = _unwrapResponseData(body);
+          final arr = data is List ? data : <dynamic>[];
+          if (arr.isNotEmpty) {
+            arr.sort((a, b) {
+              final aId =
+                  (a['subscriptionID'] ?? a['subscriptionId'] ?? 0) as num;
+              final bId =
+                  (b['subscriptionID'] ?? b['subscriptionId'] ?? 0) as num;
+              return bId.compareTo(aId);
+            });
+            final latest = arr.first as Map;
+            final status =
+                (latest['status'] ?? 'active').toString().toLowerCase().trim();
+            if (status == 'active' || status == 'trialing') {
+              hasPlan = true;
+            } else if (latest['currentPeriodEnd'] != null) {
+              final end =
+                  DateTime.tryParse(latest['currentPeriodEnd'].toString());
+              if (end != null && end.isAfter(DateTime.now().toUtc()))
+                hasPlan = true;
+            }
+          }
+        }
+      } catch (_) {}
+
+      // Average rating (requires auth; only logged-in users see section anyway)
+      double avg = 0;
+      int count = 0;
+      try {
+        final res = await http.get(
+          Uri.parse(
+              '${AppConstants.baseApiUrl}/api/UserRating/GetAllUserRatingsByMovieId/${widget.movieId}'),
+          headers: _authHeaders(),
+        );
+        if (res.statusCode >= 200 && res.statusCode < 300) {
+          final body = json.decode(res.body);
+          final data = _unwrapResponseData(body);
+          final list = data is List ? data : <dynamic>[];
+          count = list.length;
+          if (count > 0) {
+            final total = list.fold<int>(0, (sum, item) {
+              final m = item as Map;
+              final v = m['stars'] ?? m['rating'] ?? m['ratingValue'] ?? 0;
+              final s =
+                  (v is num) ? v.toInt() : int.tryParse(v.toString()) ?? 0;
+              return sum + s;
+            });
+            avg = total / count;
+          }
+        }
+      } catch (_) {}
+
+      // My rating
+      int myStars = 0;
+      int? myId;
+      try {
+        final res = await http.get(
+          Uri.parse(
+              '${AppConstants.baseApiUrl}/api/UserRating/GetAllUserRatingsByUserId/$userId'),
+          headers: _authHeaders(),
+        );
+        if (res.statusCode >= 200 && res.statusCode < 300) {
+          final body = json.decode(res.body);
+          final data = _unwrapResponseData(body);
+          final list = data is List ? data : <dynamic>[];
+          final mine = list.cast<dynamic>().whereType<Map>().firstWhere(
+                (m) => (m['movieID'] ?? m['movieId'] ?? 0) == widget.movieId,
+                orElse: () => {},
+              );
+          if (mine.isNotEmpty) {
+            final idRaw = mine['userRatingID'] ?? mine['userRatingId'];
+            myId = (idRaw is num)
+                ? idRaw.toInt()
+                : int.tryParse(idRaw?.toString() ?? '');
+            final v =
+                mine['stars'] ?? mine['rating'] ?? mine['ratingValue'] ?? 0;
+            myStars = (v is num) ? v.toInt() : int.tryParse(v.toString()) ?? 0;
+          }
+        }
+      } catch (_) {}
+
+      if (!mounted) return;
+      setState(() {
+        _hasPlan = hasPlan;
+        _avg = avg;
+        _count = count;
+        _myStars = myStars.clamp(0, 5);
+        _myUserRatingId = myId;
+        _loading = false;
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _error = e.toString();
+        _loading = false;
+      });
+    }
+  }
+
+  Future<void> _submit(int stars) async {
+    if (_submitting) return;
+
+    final info = currentUserInfo.value ?? {};
+    final userIdStr = info['userID'];
+    final userId = userIdStr != null ? int.tryParse(userIdStr) : null;
+    if (userId == null || userId <= 0) {
+      await showAuthzPromptDialog(
+        context,
+        type: AuthzPromptType.signIn,
+        onPrimary: () => context.go('/signin'),
+      );
+      return;
+    }
+
+    if (!_hasPlan) {
+      await showAuthzPromptDialog(
+        context,
+        type: AuthzPromptType.buyPlan,
+        onPrimary: () => context.go('/profile'),
+      );
+      return;
+    }
+
+    setState(() => _submitting = true);
+    try {
+      http.Response res;
+      if ((_myUserRatingId ?? 0) > 0) {
+        res = await http.put(
+          Uri.parse(
+              '${AppConstants.baseApiUrl}/api/UserRating/UpdateUserRating'),
+          headers: _authHeaders(),
+          body: json.encode({
+            'userRatingID': _myUserRatingId,
+            'userID': userId,
+            'movieID': widget.movieId,
+            'rating': stars,
+          }),
+        );
+      } else {
+        res = await http.post(
+          Uri.parse(
+              '${AppConstants.baseApiUrl}/api/UserRating/CreateUserRating'),
+          headers: _authHeaders(),
+          body: json.encode({
+            'userID': userId,
+            'movieID': widget.movieId,
+            'rating': stars,
+          }),
+        );
+      }
+
+      if (!mounted) return;
+      if (res.statusCode >= 200 && res.statusCode < 300) {
+        await _load();
+        ScaffoldMessenger.of(context)
+            .showSnackBar(const SnackBar(content: Text('Rating submitted')));
+      } else {
+        if (res.statusCode == 401) {
+          await showAuthzPromptDialog(
+            context,
+            type: AuthzPromptType.signIn,
+            onPrimary: () => context.go('/signin'),
+          );
+          return;
+        }
+        if (res.statusCode == 403) {
+          await showAuthzPromptDialog(
+            context,
+            type: AuthzPromptType.buyPlan,
+            onPrimary: () => context.go('/profile'),
+          );
+          return;
+        }
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+            content: Text('Failed to submit rating (HTTP ${res.statusCode})')));
+      }
+    } finally {
+      if (mounted) setState(() => _submitting = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final loggedIn = (isLoggedIn.value == true) && currentUserInfo.value != null;
+    final disabled = _submitting;
+    return Container(
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: Colors.white.withOpacity(0.06),
+        border: Border.all(color: Colors.white12),
+        borderRadius: BorderRadius.circular(12),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Text('Rate this Movie',
+              style: TextStyle(
+                  color: Colors.white,
+                  fontSize: 20,
+                  fontWeight: FontWeight.w700)),
+          const SizedBox(height: 12),
+          if (_loading)
+            const LinearProgressIndicator(minHeight: 2)
+          else
+            Row(
+              children: List.generate(5, (i) {
+                final idx = i + 1;
+                final selected = idx <= _myStars;
+                return Padding(
+                  padding: const EdgeInsets.only(right: 10),
+                  child: InkWell(
+                    onTap: disabled
+                        ? null
+                        : () async {
+                            if (!loggedIn) {
+                              await showAuthzPromptDialog(
+                                context,
+                                type: AuthzPromptType.signIn,
+                                onPrimary: () => context.go('/signin'),
+                              );
+                              return;
+                            }
+                            if (!_hasPlan) {
+                              await showAuthzPromptDialog(
+                                context,
+                                type: AuthzPromptType.buyPlan,
+                                onPrimary: () => context.go('/profile'),
+                              );
+                              return;
+                            }
+                            await _submit(idx);
+                          },
+                    borderRadius: BorderRadius.circular(10),
+                    child: Container(
+                      width: 48,
+                      height: 48,
+                      decoration: BoxDecoration(
+                        color: Colors.white.withOpacity(0.08),
+                        borderRadius: BorderRadius.circular(10),
+                        border: Border.all(color: Colors.white12),
+                      ),
+                      child: Icon(
+                        selected ? Icons.star : Icons.star_border,
+                        color: Colors.white.withOpacity(selected ? 0.9 : 0.35),
+                        size: 26,
+                      ),
+                    ),
+                  ),
+                );
+              }),
+            ),
+          const SizedBox(height: 10),
+          Text(
+            !loggedIn
+              ? 'Sign in to rate this movie'
+              : _hasPlan
+                ? 'Tap a star to rate this movie'
+                : 'Buy a plan to rate this movie',
+            style: TextStyle(
+                color: Colors.white.withOpacity(0.55),
+                fontSize: 14,
+                fontWeight: FontWeight.w600),
+          ),
+          if (_submitting) ...[
+            const SizedBox(height: 10),
+            const SizedBox(
+                width: 18,
+                height: 18,
+                child: CircularProgressIndicator(strokeWidth: 2)),
+          ],
+          if (_error != null) ...[
+            const SizedBox(height: 8),
+            Text(_error!,
+                style: const TextStyle(color: Colors.redAccent, fontSize: 12)),
+          ],
+        ],
+      ),
     );
   }
 }
@@ -1229,12 +3149,28 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
     _loadSources();
   }
 
+  String _friendlyAuthError(Object e) {
+    final prompt = authzPromptFromError(e);
+    if (prompt == AuthzPromptType.signIn) return 'Please sign in to continue.';
+    if (prompt == AuthzPromptType.buyPlan) return 'Please buy a plan to continue.';
+    return 'Failed to load sources: $e';
+  }
+
   Future<void> _loadSources() async {
     setState(() {
       _isLoading = true;
       _error = null;
       _sources = [];
     });
+
+    final token = StorageService.getUserToken();
+    if (token == null || token.trim().isEmpty) {
+      setState(() {
+        _error = 'Please sign in to continue.';
+        _isLoading = false;
+      });
+      return;
+    }
 
     try {
       // Primary: public movie sources by movieId
@@ -1248,25 +3184,13 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
         return;
       }
 
-      // Fallback: watchNow endpoint
-      // Fallback: watchNow endpoint
-      final watchNow = await _fetchWatchNow(widget.movie.id);
-      if (watchNow.isNotEmpty) {
-        setState(() {
-          _sources = watchNow;
-          _isLoading = false;
-        });
-        await _setupPlayerForSource(watchNow[0]);
-        return;
-      }
-
       setState(() {
         _error = 'No playable sources available.';
         _isLoading = false;
       });
     } catch (e) {
       setState(() {
-        _error = 'Failed to load sources: $e';
+        _error = _friendlyAuthError(e);
         _isLoading = false;
       });
     }
@@ -1304,58 +3228,30 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
     _videoController = null;
   }
 
-  Future<List<_PlayableSourceDemo>> _fetchWatchNow(int movieId) async {
-    final url = Uri.parse(
-        '${AppConstants.baseApiUrl}/api/Movie/GetWatchNowMovieByID/watchNow/$movieId');
-    final res = await http.get(url);
-    if (res.statusCode != 200) return [];
-    final body = jsonDecode(res.body);
-    final List<_PlayableSourceDemo> out = [];
-    if (body is Map) {
-      final singleUrl = body['sourceUrl'] ?? body['url'] ?? body['movieUrl'];
-      if (singleUrl is String && singleUrl.isNotEmpty) {
-        final id = body['sourceID'] ?? body['id'];
-        final quality = body['quality']?.toString();
-        final isVip = body['isVip'] == true;
-        final src = _PlayableSourceDemo(
-          id: id is int ? id : int.tryParse('$id'),
-          url: singleUrl,
-          quality: quality,
-          isVip: isVip,
-        );
-        final withSubs = await _attachSubtitles([src]);
-        out.addAll(withSubs);
-      }
-      final sources = body['sources'] ?? body['movieSources'] ?? body['data'];
-      if (sources is List) {
-        for (final s in sources) {
-          if (s is Map) {
-            final sourceUrl = s['sourceUrl'] ?? s['url'];
-            if (sourceUrl is String && sourceUrl.isNotEmpty) {
-              final id = s['sourceID'] ?? s['id'];
-              final quality = s['quality']?.toString();
-              final isVip = s['isVip'] == true;
-              out.add(_PlayableSourceDemo(
-                id: id is int ? id : int.tryParse('$id'),
-                url: sourceUrl,
-                quality: quality,
-                isVip: isVip,
-              ));
-            }
-          }
-        }
-        final withSubs = await _attachSubtitles(out);
-        return withSubs;
-      }
-    }
-    return out;
-  }
-
   Future<List<_PlayableSourceDemo>> _fetchMovieSources(int movieId) async {
     final url = Uri.parse(
         '${AppConstants.baseApiUrl}/movie/MovieSource/GetMovieSourcesByMovieIdPublic/getByMovieId/$movieId');
-    final res = await http.get(url);
-    if (res.statusCode != 200) return [];
+    final headers = <String, String>{
+      'Accept': 'application/json',
+    };
+    final token = StorageService.getUserToken();
+    if (token == null || token.trim().isEmpty) {
+      throw Exception('HTTP_401');
+    }
+    headers['Authorization'] = 'Bearer ${token.trim()}';
+
+    final res = await http.get(url, headers: headers);
+    if (res.statusCode == 401) {
+      throw Exception('HTTP_401');
+    }
+    if (res.statusCode == 403) {
+      throw Exception('HTTP_403');
+    }
+    if (res.statusCode != 200) {
+      final bodyPreview =
+          res.body.length > 400 ? res.body.substring(0, 400) : res.body;
+      throw Exception('MovieSources HTTP ${res.statusCode}: $bodyPreview');
+    }
     final body = jsonDecode(res.body);
     final List<_PlayableSourceDemo> out = [];
     final data = body is Map ? (body['data'] ?? body['Data'] ?? body) : body;
@@ -1604,8 +3500,23 @@ class CommentsDemoWidget extends StatefulWidget {
 
 // Simple inline player dialog for demo
 class InlinePlayerDialogDemo extends StatefulWidget {
-  final int movieId;
-  const InlinePlayerDialogDemo({super.key, required this.movieId});
+  final int? movieId;
+  final int? episodeId;
+  final String title;
+
+  const InlinePlayerDialogDemo({
+    super.key,
+    required int movieId,
+  })  : movieId = movieId,
+        episodeId = null,
+        title = 'Now Playing';
+
+  const InlinePlayerDialogDemo.episode({
+    super.key,
+    required int episodeId,
+    required this.title,
+  })  : episodeId = episodeId,
+        movieId = null;
 
   @override
   State<InlinePlayerDialogDemo> createState() => _InlinePlayerDialogDemoState();
@@ -1617,6 +3528,8 @@ class _InlinePlayerDialogDemoState extends State<InlinePlayerDialogDemo>
   String? _error;
   VideoPlayerController? _videoController;
   ChewieController? _chewieController;
+  bool _useYoutubeEmbed = false;
+  String? _youtubeUrl;
   late final AnimationController _animController;
   late final Animation<double> _scaleAnim;
 
@@ -1646,14 +3559,22 @@ class _InlinePlayerDialogDemoState extends State<InlinePlayerDialogDemo>
     _animController.forward();
   }
 
+  String _friendlyAuthError(Object e) {
+    final prompt = authzPromptFromError(e);
+    if (prompt == AuthzPromptType.signIn) return 'Please sign in to continue.';
+    if (prompt == AuthzPromptType.buyPlan) return 'Please buy a plan to continue.';
+    return 'Playback failed: $e';
+  }
+
   Future<void> _load() async {
     setState(() {
       _loading = true;
       _error = null;
     });
     try {
-      final src = await _fetchPrimarySource(widget.movieId) ??
-          await _fetchWatchNowSource(widget.movieId);
+      final src = widget.episodeId != null
+          ? await _fetchPrimaryEpisodeSource(widget.episodeId!)
+          : await _fetchPrimaryMovieSource(widget.movieId!);
       if (src == null) {
         setState(() {
           _error = 'No playable source';
@@ -1662,6 +3583,18 @@ class _InlinePlayerDialogDemoState extends State<InlinePlayerDialogDemo>
         return;
       }
       _currentSource = src;
+
+      if (isYoutubeUrl(src.url)) {
+        setState(() {
+          _useYoutubeEmbed = true;
+          _youtubeUrl = src.url;
+          _loading = false;
+          _error = null;
+        });
+        _scheduleHideUI();
+        return;
+      }
+
       final vc = VideoPlayerController.networkUrl(Uri.parse(src.url));
       await vc.initialize();
       // Optionally load subtitles for current source if enabled
@@ -1697,64 +3630,108 @@ class _InlinePlayerDialogDemoState extends State<InlinePlayerDialogDemo>
       setState(() {
         _videoController = vc;
         _chewieController = cc;
+        _useYoutubeEmbed = false;
+        _youtubeUrl = null;
         _loading = false;
       });
       _scheduleHideUI();
     } catch (e) {
+      final srcUrl = _currentSource?.url;
+      if (srcUrl != null && isYoutubeUrl(srcUrl)) {
+        setState(() {
+          _useYoutubeEmbed = true;
+          _youtubeUrl = srcUrl;
+          _loading = false;
+          _error = null;
+        });
+        _scheduleHideUI();
+        return;
+      }
       setState(() {
-        _error = 'Playback failed: $e';
+        _error = _friendlyAuthError(e);
         _loading = false;
       });
     }
   }
 
-  Future<_DemoSource?> _fetchPrimarySource(int id) async {
+  Future<_DemoSource?> _fetchPrimaryMovieSource(int id) async {
     final uri = Uri.parse(
         '${AppConstants.baseApiUrl}/movie/MovieSource/GetMovieSourcesByMovieIdPublic/getByMovieId/$id');
-    final res = await http.get(uri);
-    if (res.statusCode != 200) return null;
+    final headers = <String, String>{
+      'Accept': 'application/json',
+    };
+    final token = StorageService.getUserToken();
+    if (token == null || token.trim().isEmpty) {
+      throw Exception('HTTP_401');
+    }
+    headers['Authorization'] = 'Bearer ${token.trim()}';
+
+    final res = await http.get(uri, headers: headers);
+    if (res.statusCode == 401) {
+      throw Exception('HTTP_401');
+    }
+    if (res.statusCode == 403) {
+      throw Exception('HTTP_403');
+    }
+    if (res.statusCode != 200) {
+      final bodyPreview =
+          res.body.length > 500 ? res.body.substring(0, 500) : res.body;
+      throw Exception('MovieSources HTTP ${res.statusCode}: $bodyPreview');
+    }
     final body = jsonDecode(res.body);
     final data = body is Map ? (body['data'] ?? body['Data'] ?? body) : body;
     if (data is List && data.isNotEmpty) {
       final first = data.first;
       if (first is Map) {
-        final url = first['sourceUrl'] ?? first['url'];
+        final sourceUrl = first['sourceUrl'] ?? first['url'];
         final id0 = first['movieSourceID'] ?? first['sourceID'] ?? first['id'];
         final sid = id0 is int ? id0 : int.tryParse('$id0');
-        if (sid != null && url is String && url.isNotEmpty) {
-          final subs = await _fetchSubtitlesBySourceId(sid);
-          return _DemoSource(id: sid, url: url, subtitles: subs);
+        if (sid != null && sourceUrl is String && sourceUrl.isNotEmpty) {
+          final subs = await _fetchSubtitlesBySourceId(sid, isEpisode: false);
+          return _DemoSource(id: sid, url: sourceUrl, subtitles: subs);
         }
       }
     }
     return null;
   }
 
-  Future<_DemoSource?> _fetchWatchNowSource(int id) async {
+  Future<_DemoSource?> _fetchPrimaryEpisodeSource(int episodeId) async {
     final uri = Uri.parse(
-        '${AppConstants.baseApiUrl}/api/Movie/GetWatchNowMovieByID/watchNow/$id');
-    final res = await http.get(uri);
-    if (res.statusCode != 200) return null;
+        '${AppConstants.baseApiUrl}/movie/EpisodeSource/GetEpisodeSourcesByEpisodeId/$episodeId');
+    final headers = <String, String>{
+      'Accept': 'application/json',
+    };
+    final token = StorageService.getUserToken();
+    if (token == null || token.trim().isEmpty) {
+      throw Exception('HTTP_401');
+    }
+    headers['Authorization'] = 'Bearer ${token.trim()}';
+
+    final res = await http.get(uri, headers: headers);
+    if (res.statusCode == 401) {
+      throw Exception('HTTP_401');
+    }
+    if (res.statusCode == 403) {
+      throw Exception('HTTP_403');
+    }
+    if (res.statusCode != 200) {
+      final bodyPreview =
+          res.body.length > 500 ? res.body.substring(0, 500) : res.body;
+      throw Exception('EpisodeSources HTTP ${res.statusCode}: $bodyPreview');
+    }
+
     final body = jsonDecode(res.body);
-    if (body is Map) {
-      final url = body['sourceUrl'] ?? body['url'] ?? body['movieUrl'];
-      final id0 = body['sourceID'] ?? body['id'];
-      final sid = id0 is int ? id0 : int.tryParse('$id0');
-      if (sid != null && url is String && url.isNotEmpty) {
-        final subs = await _fetchSubtitlesBySourceId(sid);
-        return _DemoSource(id: sid, url: url, subtitles: subs);
-      }
-      final many = body['data'];
-      if (many is List && many.isNotEmpty) {
-        final m0 = many.first;
-        if (m0 is Map) {
-          final u = m0['sourceUrl'] ?? m0['url'];
-          final id0b = m0['sourceID'] ?? m0['id'];
-          final sidb = id0b is int ? id0b : int.tryParse('$id0b');
-          if (sidb != null && u is String && u.isNotEmpty) {
-            final subs = await _fetchSubtitlesBySourceId(sidb);
-            return _DemoSource(id: sidb, url: u, subtitles: subs);
-          }
+    final data = body is Map ? (body['data'] ?? body['Data'] ?? body) : body;
+    if (data is List && data.isNotEmpty) {
+      final first = data.first;
+      if (first is Map) {
+        final sourceUrl = first['sourceUrl'] ?? first['url'];
+        final id0 =
+            first['episodeSourceID'] ?? first['sourceID'] ?? first['id'];
+        final sid = id0 is int ? id0 : int.tryParse('$id0');
+        if (sid != null && sourceUrl is String && sourceUrl.isNotEmpty) {
+          final subs = await _fetchSubtitlesBySourceId(sid, isEpisode: true);
+          return _DemoSource(id: sid, url: sourceUrl, subtitles: subs);
         }
       }
     }
@@ -1762,16 +3739,27 @@ class _InlinePlayerDialogDemoState extends State<InlinePlayerDialogDemo>
   }
 
   Future<List<Map<String, String>>> _fetchSubtitlesBySourceId(
-      int sourceId) async {
+    int sourceId, {
+    required bool isEpisode,
+  }) async {
     try {
-      final url = Uri.parse(
-          '${AppConstants.baseApiUrl}/api/MovieSubTitle/GetAllSubTitlesByMovieId/movie/GetAllSubTitlesBySourceID/$sourceId');
-      final res = await http.get(url);
+      final url = Uri.parse(isEpisode
+          ? '${AppConstants.baseApiUrl}/api/MovieSubTitle/GetAllSubTitlesByEpisodeId/episode/GetAllSubTitlesBySourceID/$sourceId'
+          : '${AppConstants.baseApiUrl}/api/MovieSubTitle/GetAllSubTitlesByMovieId/movie/GetAllSubTitlesBySourceID/$sourceId');
+      final headers = <String, String>{
+        'Accept': 'application/json',
+      };
+      final token = StorageService.getUserToken();
+      if (token != null && token.trim().isNotEmpty) {
+        headers['Authorization'] = 'Bearer ${token.trim()}';
+      }
+
+      final res = await http.get(url, headers: headers);
       if (res.statusCode != 200) return [];
       final body = jsonDecode(res.body);
       List<dynamic> list = [];
-      if (body is Map && body['data'] is List) {
-        list = (body['data'] as List);
+      if (body is Map && (body['data'] is List || body['Data'] is List)) {
+        list = (body['data'] as List?) ?? (body['Data'] as List?) ?? [];
       } else if (body is List) {
         list = body;
       }
@@ -1784,7 +3772,10 @@ class _InlinePlayerDialogDemoState extends State<InlinePlayerDialogDemo>
           final subUrl = sub['linkSubTitle']?.toString() ??
               sub['subtitleUrl']?.toString() ??
               sub['url']?.toString();
-          final idVal = sub['movieSubTitleID'] ?? sub['MovieSubTitleID'] ?? sub['subTitleID'] ?? sub['id'];
+          final idVal = sub['movieSubTitleID'] ??
+              sub['MovieSubTitleID'] ??
+              sub['subTitleID'] ??
+              sub['id'];
           if (subUrl != null && subUrl.isNotEmpty) {
             subs.add({
               'lang': lang,
@@ -1851,7 +3842,16 @@ class _InlinePlayerDialogDemoState extends State<InlinePlayerDialogDemo>
     _subtitleUrl = url;
     _isFetchingSubs = true;
     try {
-      final res = await http.get(Uri.parse(url));
+      final subtitleUri = Uri.parse(url);
+      final token = StorageService.getUserToken();
+      final needsAuth = token != null &&
+          token.trim().isNotEmpty &&
+          url.startsWith(AppConstants.baseApiUrl);
+      final res = await http.get(
+        subtitleUri,
+        headers:
+            needsAuth ? {'Authorization': 'Bearer ${token!.trim()}'} : null,
+      );
       if (res.statusCode == 200) {
         _subtitleCues = _parseSrtOrVttToChewie(res.body);
         if (_subtitleCues.isNotEmpty) {
@@ -1859,14 +3859,14 @@ class _InlinePlayerDialogDemoState extends State<InlinePlayerDialogDemo>
           final last = _subtitleCues.last;
           // Basic diagnostics to verify parsing in web console
           // ignore: avoid_print
-          print('Subtitles loaded: ${_subtitleCues.length} cues from '+url);
+          print('Subtitles loaded: ${_subtitleCues.length} cues from ' + url);
           // ignore: avoid_print
           print('First cue: ${first.start} -> ${first.end}');
           // ignore: avoid_print
           print('Last cue: ${last.start} -> ${last.end}');
         } else {
           // ignore: avoid_print
-          print('Subtitles parse produced 0 cues for '+url);
+          print('Subtitles parse produced 0 cues for ' + url);
         }
       } else {
         _subtitleCues = const [];
@@ -1881,7 +3881,8 @@ class _InlinePlayerDialogDemoState extends State<InlinePlayerDialogDemo>
   List<Subtitle> _parseSrtOrVttToChewie(String content) {
     final cleaned = content.replaceAll('\ufeff', '').replaceAll('\r', '');
     final lines = cleaned.split('\n');
-    if (lines.isNotEmpty && lines.first.trim().toUpperCase().startsWith('WEBVTT')) {
+    if (lines.isNotEmpty &&
+        lines.first.trim().toUpperCase().startsWith('WEBVTT')) {
       lines.removeAt(0);
       // Skip optional header separator
       if (lines.isNotEmpty && lines.first.trim().isEmpty) {
@@ -2026,7 +4027,9 @@ class _InlinePlayerDialogDemoState extends State<InlinePlayerDialogDemo>
         ),
       ],
     );
-    setState(() { _uiVisible = true; });
+    setState(() {
+      _uiVisible = true;
+    });
     _scheduleHideUI();
   }
 
@@ -2034,14 +4037,18 @@ class _InlinePlayerDialogDemoState extends State<InlinePlayerDialogDemo>
     _hideTimer?.cancel();
     _hideTimer = Timer(const Duration(seconds: 3), () {
       if (mounted) {
-        setState(() { _uiVisible = false; });
+        setState(() {
+          _uiVisible = false;
+        });
       }
     });
   }
 
   void _showUI() {
     if (!_uiVisible) {
-      setState(() { _uiVisible = true; });
+      setState(() {
+        _uiVisible = true;
+      });
     }
     _scheduleHideUI();
   }
@@ -2136,7 +4143,7 @@ class _InlinePlayerDialogDemoState extends State<InlinePlayerDialogDemo>
                 Row(
                   mainAxisAlignment: MainAxisAlignment.spaceBetween,
                   children: [
-                    const Text('Now Playing',
+                    Text(widget.title,
                         style: TextStyle(
                             color: Colors.white,
                             fontSize: 16,
@@ -2153,72 +4160,86 @@ class _InlinePlayerDialogDemoState extends State<InlinePlayerDialogDemo>
                   child: GestureDetector(
                     onTap: _showUI,
                     child: AspectRatio(
-                  aspectRatio: _videoController?.value.aspectRatio ?? 16 / 9,
-                  child: Stack(
-                    children: [
-                      _loading
-                          ? const Center(child: CircularProgressIndicator())
-                          : _error != null
-                              ? Center(
-                                  child: Text(_error!,
-                                      style: const TextStyle(
-                                          color: Colors.white70)))
-                              : (_chewieController != null
-                                  ? Chewie(controller: _chewieController!)
-                                  : const SizedBox.shrink()),
-                      // Custom dropdown settings (playback speed + subtitles)
-                      if (_uiVisible || (_chewieController?.isFullScreen ?? false)) Positioned(
-                        right: 88,
-                        bottom: 8,
-                        child: PopupMenuButton<String>(
-                          tooltip: 'Settings',
-                          color: Colors.black87,
-                          icon: const Icon(Icons.settings, color: Colors.white),
-                          offset: const Offset(0, -8),
-                          onSelected: (value) async {
-                            switch (value) {
-                              case 'speed':
-                                await _showSpeedMenu();
-                                break;
-                              case 'subs':
-                                await _pickSubtitleLanguage();
-                                break;
-                            }
-                          },
-                          itemBuilder: (ctx) => const [
-                            PopupMenuItem(
-                              value: 'speed',
-                              child: Row(
-                                children: [
-                                  Icon(Icons.speed, color: Colors.white70),
-                                  SizedBox(width: 8),
-                                  Text('Playback speed',
-                                      style: TextStyle(color: Colors.white)),
+                      aspectRatio:
+                          _videoController?.value.aspectRatio ?? 16 / 9,
+                      child: Stack(
+                        children: [
+                          _loading
+                              ? const Center(child: CircularProgressIndicator())
+                              : _error != null
+                                  ? Center(
+                                      child: Text(_error!,
+                                          style: const TextStyle(
+                                              color: Colors.white70)))
+                                  : (_useYoutubeEmbed && _youtubeUrl != null)
+                                      ? Positioned.fill(
+                                          child: YoutubeEmbedPlayer(
+                                              url: _youtubeUrl!),
+                                        )
+                                      : (_chewieController != null
+                                          ? Chewie(
+                                              controller: _chewieController!)
+                                          : const SizedBox.shrink()),
+                          // Custom dropdown settings (playback speed + subtitles)
+                          if (!(_useYoutubeEmbed && _youtubeUrl != null) &&
+                              (_uiVisible ||
+                                  (_chewieController?.isFullScreen ?? false)))
+                            Positioned(
+                              right: 88,
+                              bottom: 8,
+                              child: PopupMenuButton<String>(
+                                tooltip: 'Settings',
+                                color: Colors.black87,
+                                icon: const Icon(Icons.settings,
+                                    color: Colors.white),
+                                offset: const Offset(0, -8),
+                                onSelected: (value) async {
+                                  switch (value) {
+                                    case 'speed':
+                                      await _showSpeedMenu();
+                                      break;
+                                    case 'subs':
+                                      await _pickSubtitleLanguage();
+                                      break;
+                                  }
+                                },
+                                itemBuilder: (ctx) => const [
+                                  PopupMenuItem(
+                                    value: 'speed',
+                                    child: Row(
+                                      children: [
+                                        Icon(Icons.speed,
+                                            color: Colors.white70),
+                                        SizedBox(width: 8),
+                                        Text('Playback speed',
+                                            style:
+                                                TextStyle(color: Colors.white)),
+                                      ],
+                                    ),
+                                  ),
+                                  PopupMenuItem(
+                                    value: 'subs',
+                                    child: Row(
+                                      children: [
+                                        Icon(Icons.closed_caption,
+                                            color: Colors.white70),
+                                        SizedBox(width: 8),
+                                        Text('Subtitles',
+                                            style:
+                                                TextStyle(color: Colors.white)),
+                                      ],
+                                    ),
+                                  ),
                                 ],
                               ),
                             ),
-                            PopupMenuItem(
-                              value: 'subs',
-                              child: Row(
-                                children: [
-                                  Icon(Icons.closed_caption,
-                                      color: Colors.white70),
-                                  SizedBox(width: 8),
-                                  Text('Subtitles',
-                                      style: TextStyle(color: Colors.white)),
-                                ],
-                              ),
-                            ),
-                          ],
-                        ),
+                          // CC debug overlay removed
+                          // Removed custom CC toggle; rely on Chewie's built-in CC icon
+                        ],
                       ),
-                      // CC debug overlay removed
-                      // Removed custom CC toggle; rely on Chewie's built-in CC icon
-                    ],
+                    ),
                   ),
                 ),
-              ),
-            ),
               ],
             ),
           ),
@@ -2235,6 +4256,9 @@ class _CommentsDemoWidgetState extends State<CommentsDemoWidget> {
   final TextEditingController _composer = TextEditingController();
   int? _replyingTo;
   bool _posting = false;
+
+  final Map<int, _UserSlimLite> _userCache = <int, _UserSlimLite>{};
+  final Set<int> _fetchingUsers = <int>{};
 
   @override
   void initState() {
@@ -2255,24 +4279,38 @@ class _CommentsDemoWidgetState extends State<CommentsDemoWidget> {
     });
     try {
       final uri = Uri.parse(
-          '${AppConstants.baseApiUrl}/api/Comment/GetCommentsByMovieID/${widget.movieId}?movieID=${widget.movieId}');
-      final res = await http.get(uri);
+          '${AppConstants.baseApiUrl}/api/Comment/GetCommentsByMovieID/${widget.movieId}');
+      final res = await _httpClient.get(uri, headers: _authHeaders());
       if (res.statusCode == 200) {
         final body = jsonDecode(res.body);
-        final data = (body is Map<String, dynamic>)
-            ? (body['data'] ?? body['Data'] ?? body)
-            : body;
-        final list = (data is List ? data : [])
-            .map((e) => CommentDemo.fromJson(e as Map<String, dynamic>))
-            .toList();
+        final data = _unwrapResponseData(body);
+        final raw = data is List ? data : const [];
+        final list = <CommentDemo>[];
+        for (final e in raw) {
+          if (e is Map<String, dynamic>) {
+            list.add(CommentDemo.fromJson(e));
+          }
+        }
         list.sort((a, b) => b.createdAt.compareTo(a.createdAt));
         setState(() {
           _comments = list;
           _loading = false;
         });
+
+        unawaited(_prefetchUsersForComments(list));
+      } else if (res.statusCode == 401) {
+        setState(() {
+          _error = 'Please sign in to view comments';
+          _loading = false;
+        });
+      } else if (res.statusCode == 403) {
+        setState(() {
+          _error = 'Please buy a plan to view comments';
+          _loading = false;
+        });
       } else {
         setState(() {
-          _error = 'Failed to fetch comments';
+          _error = 'Failed to fetch comments (HTTP ${res.statusCode})';
           _loading = false;
         });
       }
@@ -2284,12 +4322,69 @@ class _CommentsDemoWidgetState extends State<CommentsDemoWidget> {
     }
   }
 
+  Future<void> _prefetchUsersForComments(List<CommentDemo> list) async {
+    if (!mounted) return;
+    if (!isLoggedIn.value) return;
+
+    final info = currentUserInfo.value;
+    final meId = int.tryParse((info?['userID'] ?? info?['userId'] ?? '').toString());
+
+    final ids = list
+        .map((c) => c.userID)
+        .where((id) => id > 0 && id != meId)
+        .toSet();
+    final missing = ids.where((id) => !_userCache.containsKey(id) && !_fetchingUsers.contains(id)).toList();
+    if (missing.isEmpty) return;
+
+    for (final id in missing) {
+      _fetchingUsers.add(id);
+    }
+
+    try {
+      // Limit concurrency to avoid spamming the backend.
+      int index = 0;
+      Future<void> worker() async {
+        while (index < missing.length) {
+          final userId = missing[index++];
+          try {
+            final data = await UserService().getUserSlimById(userId);
+            final profile = (data['profile'] is Map)
+                ? Map<String, dynamic>.from(data['profile'] as Map)
+                : null;
+            final userName = (data['userName'] ?? data['UserName'] ?? data['name'] ?? '').toString();
+            final avatar = (data['avatar'] ?? profile?['avatar'])?.toString();
+            if (mounted) {
+              setState(() {
+                _userCache[userId] = _UserSlimLite(
+                  userId: userId,
+                  userName: userName.isEmpty ? 'User' : userName,
+                  avatar: (avatar != null && avatar.isNotEmpty) ? avatar : null,
+                );
+              });
+            }
+          } catch (_) {
+            // ignore
+          } finally {
+            _fetchingUsers.remove(userId);
+          }
+        }
+      }
+
+      await Future.wait(List.generate(6, (_) => worker()));
+    } catch (_) {
+      // ignore
+    }
+  }
+
   Future<void> _post({required String text, int? parentId}) async {
     final info = currentUserInfo.value;
     final logged = isLoggedIn.value;
     if (!logged || info == null) {
-      ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Please sign in to comment')));
+      await showAuthzPromptDialog(
+        context,
+        type: AuthzPromptType.signIn,
+        onPrimary: () => context.go('/signin'),
+      );
       return;
     }
     final userIdStr = info['userID'];
@@ -2313,14 +4408,27 @@ class _CommentsDemoWidgetState extends State<CommentsDemoWidget> {
         'content': text.trim(),
         if (parentId != null) 'parentID': parentId,
       });
-      final res = await http.post(uri,
-          headers: {'Content-Type': 'application/json'}, body: body);
+      final headers = _authHeaders();
+      headers['Content-Type'] = 'application/json';
+      final res = await _httpClient.post(uri, headers: headers, body: body);
       if (res.statusCode >= 200 && res.statusCode < 300) {
         _composer.clear();
         setState(() {
           _replyingTo = null;
         });
         await _loadComments();
+      } else if (res.statusCode == 401) {
+        await showAuthzPromptDialog(
+          context,
+          type: AuthzPromptType.signIn,
+          onPrimary: () => context.go('/signin'),
+        );
+      } else if (res.statusCode == 403) {
+        await showAuthzPromptDialog(
+          context,
+          type: AuthzPromptType.buyPlan,
+          onPrimary: () => context.go('/profile'),
+        );
       } else {
         ScaffoldMessenger.of(context).showSnackBar(
             const SnackBar(content: Text('Failed to post comment')));
@@ -2365,10 +4473,21 @@ class _CommentsDemoWidgetState extends State<CommentsDemoWidget> {
   }
 
   Widget _buildComposer() {
+    final info = currentUserInfo.value;
+    final avatarUrl = cacheBustUrl(
+      resolveApiUrl(info?['avatar']),
+      cacheKey: avatarCacheBuster.value,
+    );
     return Row(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        const CircleAvatar(radius: 18, child: Icon(Icons.person, size: 18)),
+        CircleAvatar(
+          radius: 18,
+          backgroundImage: avatarUrl.isNotEmpty ? NetworkImage(avatarUrl) : null,
+          child: avatarUrl.isNotEmpty
+              ? null
+              : const Icon(Icons.person, size: 18),
+        ),
         const SizedBox(width: 12),
         Expanded(
           child: Column(
@@ -2387,7 +4506,7 @@ class _CommentsDemoWidgetState extends State<CommentsDemoWidget> {
                   fillColor: Colors.white10,
                   border: const OutlineInputBorder(),
                 ),
-                enabled: isLoggedIn.value && !_posting,
+                enabled: !_posting,
               ),
               const SizedBox(height: 8),
               Align(
@@ -2433,6 +4552,22 @@ class _CommentsDemoWidgetState extends State<CommentsDemoWidget> {
   }
 
   Widget _buildCommentItem(CommentDemo c, List<CommentDemo> replies) {
+    final info = currentUserInfo.value;
+    final meId = int.tryParse((info?['userID'] ?? info?['userId'] ?? '').toString());
+    final isMe = meId != null && c.userID == meId;
+    final other = _userCache[c.userID];
+    final displayName = isMe
+        ? (info?['userName'] ?? '')
+        : ((other?.userName.isNotEmpty == true)
+            ? other!.userName
+            : (c.userName ?? ''));
+    final avatarUrl = isMe
+        ? cacheBustUrl(
+            resolveApiUrl(info?['avatar']),
+            cacheKey: avatarCacheBuster.value,
+          )
+        : resolveApiUrl(other?.avatar);
+
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 8),
       child: Column(
@@ -2442,10 +4577,14 @@ class _CommentsDemoWidgetState extends State<CommentsDemoWidget> {
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
               CircleAvatar(
-                  radius: 16,
-                  child: Text(
-                      (c.userName?.isNotEmpty == true ? c.userName![0] : 'U')
-                          .toUpperCase())),
+                radius: 16,
+                backgroundImage: avatarUrl.isNotEmpty ? NetworkImage(avatarUrl) : null,
+                child: avatarUrl.isNotEmpty
+                    ? null
+                    : Text(
+                        ((displayName.isNotEmpty ? displayName[0] : 'U')).toUpperCase(),
+                      ),
+              ),
               const SizedBox(width: 12),
               Expanded(
                 child: Column(
@@ -2453,7 +4592,7 @@ class _CommentsDemoWidgetState extends State<CommentsDemoWidget> {
                   children: [
                     Row(
                       children: [
-                        Text(c.userName ?? 'User',
+                        Text(displayName.isNotEmpty ? displayName : 'User',
                             style: const TextStyle(
                                 color: Colors.white,
                                 fontSize: 14,
@@ -2528,15 +4667,34 @@ class _CommentsDemoWidgetState extends State<CommentsDemoWidget> {
       padding: const EdgeInsets.only(top: 8, left: 24),
       child: Column(
         children: replies.map((r) {
+          final info = currentUserInfo.value;
+          final meId = int.tryParse((info?['userID'] ?? info?['userId'] ?? '').toString());
+          final isMe = meId != null && r.userID == meId;
+          final other = _userCache[r.userID];
+          final displayName = isMe
+              ? (info?['userName'] ?? '')
+              : ((other?.userName.isNotEmpty == true)
+                  ? other!.userName
+                  : (r.userName ?? ''));
+          final avatarUrl = isMe
+              ? cacheBustUrl(
+                  resolveApiUrl(info?['avatar']),
+                  cacheKey: avatarCacheBuster.value,
+                )
+              : resolveApiUrl(other?.avatar);
           return Row(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
               CircleAvatar(
-                  radius: 14,
-                  child: Text(
-                      (r.userName?.isNotEmpty == true ? r.userName![0] : 'U')
-                          .toUpperCase(),
-                      style: const TextStyle(fontSize: 12))),
+                radius: 14,
+                backgroundImage: avatarUrl.isNotEmpty ? NetworkImage(avatarUrl) : null,
+                child: avatarUrl.isNotEmpty
+                    ? null
+                    : Text(
+                        ((displayName.isNotEmpty ? displayName[0] : 'U')).toUpperCase(),
+                        style: const TextStyle(fontSize: 12),
+                      ),
+              ),
               const SizedBox(width: 8),
               Expanded(
                 child: Column(
@@ -2544,7 +4702,7 @@ class _CommentsDemoWidgetState extends State<CommentsDemoWidget> {
                   children: [
                     Row(
                       children: [
-                        Text(r.userName ?? 'User',
+                        Text(displayName.isNotEmpty ? displayName : 'User',
                             style: const TextStyle(
                                 color: Colors.white,
                                 fontSize: 13,
@@ -2592,6 +4750,414 @@ class _CommentsDemoWidgetState extends State<CommentsDemoWidget> {
 }
 
 // Profile Screen
+enum _MovieBoxSort { dateAdded, title, rating }
+
+class MovieBoxScreen extends StatefulWidget {
+  const MovieBoxScreen({super.key});
+
+  @override
+  State<MovieBoxScreen> createState() => _MovieBoxScreenState();
+}
+
+class _MovieBoxScreenState extends State<MovieBoxScreen> {
+  _MovieBoxSort _sort = _MovieBoxSort.dateAdded;
+  final Map<int, Movie> _cache = <int, Movie>{};
+  final Set<int> _loading = <int>{};
+
+  @override
+  void initState() {
+    super.initState();
+    unawaited(_refresh());
+    savedMovieIds.addListener(_handleSavedIdsChanged);
+  }
+
+  @override
+  void dispose() {
+    savedMovieIds.removeListener(_handleSavedIdsChanged);
+    super.dispose();
+  }
+
+  void _handleSavedIdsChanged() {
+    if (!mounted) return;
+    unawaited(_ensureLoaded(savedMovieIds.value));
+  }
+
+  Future<void> _refresh() async {
+    await _ensureCurrentUserFromCookiesIfNeeded();
+    await refreshSavedMoviesForCurrentUser();
+    await _ensureLoaded(savedMovieIds.value);
+  }
+
+  Future<void> _ensureLoaded(Set<int> ids) async {
+    final missing = ids.where((id) => !_cache.containsKey(id)).toList();
+    if (missing.isEmpty) {
+      setState(() {
+        _cache.removeWhere((key, _) => !ids.contains(key));
+      });
+      return;
+    }
+
+    for (final id in missing) {
+      if (_loading.contains(id)) continue;
+      _loading.add(id);
+      unawaited(_loadOne(id));
+    }
+  }
+
+  Future<void> _loadOne(int movieId) async {
+    try {
+      Movie? fromApp;
+      for (final m in appMovies) {
+        if (m.id == movieId) {
+          fromApp = m;
+          break;
+        }
+      }
+      final movie = fromApp ?? await _fetchBasicMovieByIdForMovieBox(movieId);
+      if (!mounted) return;
+      setState(() {
+        _cache[movieId] = movie;
+        _loading.remove(movieId);
+      });
+    } catch (_) {
+      if (!mounted) return;
+      setState(() {
+        _loading.remove(movieId);
+      });
+    }
+  }
+
+  List<int> _sortedIds(Set<int> ids) {
+    final list = ids.toList();
+    list.sort((a, b) {
+      final ma = _cache[a];
+      final mb = _cache[b];
+      switch (_sort) {
+        case _MovieBoxSort.title:
+          return (ma?.title ?? '').toLowerCase().compareTo(
+                (mb?.title ?? '').toLowerCase(),
+              );
+        case _MovieBoxSort.rating:
+          return (mb?.popularity ?? 0).compareTo(ma?.popularity ?? 0);
+        case _MovieBoxSort.dateAdded:
+          final da = savedMovieCreatedAtMap.value[a];
+          final db = savedMovieCreatedAtMap.value[b];
+          return (db ?? DateTime.fromMillisecondsSinceEpoch(0))
+              .compareTo(da ?? DateTime.fromMillisecondsSinceEpoch(0));
+      }
+    });
+    return list;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: Colors.black,
+      appBar: AppBar(
+        title: const Text('MovieBox'),
+        backgroundColor: Colors.black,
+        foregroundColor: Colors.white,
+        leading: IconButton(
+          icon: const Icon(Icons.arrow_back),
+          onPressed: () => context.go('/'),
+        ),
+      ),
+      body: ValueListenableBuilder<Set<int>>(
+        valueListenable: savedMovieIds,
+        builder: (context, ids, _) {
+          final sorted = _sortedIds(ids);
+          if (sorted.isEmpty) {
+            return Center(
+              child: ConstrainedBox(
+                constraints: const BoxConstraints(maxWidth: 520),
+                child: Padding(
+                  padding: const EdgeInsets.all(24),
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      const Icon(Icons.bookmark_border,
+                          size: 84, color: Colors.white24),
+                      const SizedBox(height: 14),
+                      const Text(
+                        'Your MovieBox is empty',
+                        textAlign: TextAlign.center,
+                        style: TextStyle(
+                            color: Colors.white,
+                            fontSize: 22,
+                            fontWeight: FontWeight.w700),
+                      ),
+                      const SizedBox(height: 8),
+                      const Text(
+                        'Save movies to watch later.',
+                        textAlign: TextAlign.center,
+                        style: TextStyle(color: Colors.white70, fontSize: 15),
+                      ),
+                      const SizedBox(height: 18),
+                      SizedBox(
+                        width: double.infinity,
+                        child: ElevatedButton(
+                          style: ElevatedButton.styleFrom(
+                            backgroundColor: Colors.red,
+                            foregroundColor: Colors.white,
+                            padding: const EdgeInsets.symmetric(vertical: 14),
+                            shape: RoundedRectangleBorder(
+                                borderRadius: BorderRadius.circular(10)),
+                          ),
+                          onPressed: () => context.go('/'),
+                          child: const Text('Browse Movies'),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            );
+          }
+
+          return Center(
+            child: ConstrainedBox(
+              constraints: const BoxConstraints(maxWidth: 1200),
+              child: ListView(
+                padding: const EdgeInsets.all(20),
+                children: [
+                  Row(
+                    children: [
+                      Text(
+                        '${sorted.length} movies saved',
+                        style: const TextStyle(
+                            color: Colors.white70,
+                            fontSize: 14,
+                            fontWeight: FontWeight.w500),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 10),
+                  Wrap(
+                    spacing: 10,
+                    runSpacing: 10,
+                    children: [
+                      ChoiceChip(
+                        label: const Text('Date Added'),
+                        selected: _sort == _MovieBoxSort.dateAdded,
+                        onSelected: (_) => setState(
+                            () => _sort = _MovieBoxSort.dateAdded),
+                      ),
+                      ChoiceChip(
+                        label: const Text('Movie Title'),
+                        selected: _sort == _MovieBoxSort.title,
+                        onSelected: (_) =>
+                            setState(() => _sort = _MovieBoxSort.title),
+                      ),
+                      ChoiceChip(
+                        label: const Text('Rating'),
+                        selected: _sort == _MovieBoxSort.rating,
+                        onSelected: (_) =>
+                            setState(() => _sort = _MovieBoxSort.rating),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 18),
+                  LayoutBuilder(
+                    builder: (context, constraints) {
+                      final w = constraints.maxWidth;
+                      final crossAxisCount =
+                          w < 560 ? 2 : (w < 900 ? 3 : (w < 1200 ? 4 : 5));
+                      return GridView.builder(
+                        shrinkWrap: true,
+                        physics: const NeverScrollableScrollPhysics(),
+                        itemCount: sorted.length,
+                        gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
+                          crossAxisCount: crossAxisCount,
+                          crossAxisSpacing: 16,
+                          mainAxisSpacing: 16,
+                          childAspectRatio: 0.66,
+                        ),
+                        itemBuilder: (context, index) {
+                          final id = sorted[index];
+                          final movie = _cache[id];
+                          return _MovieBoxCard(
+                            movieId: id,
+                            movie: movie,
+                            onOpen: () => context.go('/movie/$id'),
+                            onRemove: () async {
+                              try {
+                                await removeFromMovieBox(id);
+                              } catch (e) {
+                                if (!context.mounted) return;
+                                final prompt = authzPromptFromError(e);
+                                if (prompt == AuthzPromptType.signIn) {
+                                  await showAuthzPromptDialog(
+                                    context,
+                                    type: AuthzPromptType.signIn,
+                                    onPrimary: () => context.go('/signin'),
+                                  );
+                                  return;
+                                }
+                                if (prompt == AuthzPromptType.buyPlan) {
+                                  await showAuthzPromptDialog(
+                                    context,
+                                    type: AuthzPromptType.buyPlan,
+                                    onPrimary: () => context.go('/profile'),
+                                  );
+                                  return;
+                                }
+
+                                ScaffoldMessenger.of(context).showSnackBar(
+                                  const SnackBar(
+                                      content: Text('Failed to remove movie')),
+                                );
+                              }
+                            },
+                          );
+                        },
+                      );
+                    },
+                  ),
+                ],
+              ),
+            ),
+          );
+        },
+      ),
+    );
+  }
+}
+
+class _MovieBoxCard extends StatelessWidget {
+  final int movieId;
+  final Movie? movie;
+  final VoidCallback onOpen;
+  final VoidCallback onRemove;
+
+  const _MovieBoxCard({
+    required this.movieId,
+    required this.movie,
+    required this.onOpen,
+    required this.onRemove,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final title = movie?.title ?? 'Loading…';
+    final year = movie?.year ?? '—';
+    final imageUrl = movie?.imageUrl;
+    final score = movie?.popularity;
+
+    return Material(
+      color: Colors.transparent,
+      child: InkWell(
+        onTap: onOpen,
+        borderRadius: BorderRadius.circular(12),
+        child: ClipRRect(
+          borderRadius: BorderRadius.circular(12),
+          child: Stack(
+            fit: StackFit.expand,
+            children: [
+              if (imageUrl != null)
+                Image.network(
+                  imageUrl,
+                  fit: BoxFit.cover,
+                  errorBuilder: (_, __, ___) => Container(
+                      color: Colors.grey[900],
+                      child: const Center(
+                          child:
+                              Icon(Icons.broken_image, color: Colors.white24))),
+                )
+              else
+                Container(color: Colors.grey[900]),
+              DecoratedBox(
+                decoration: BoxDecoration(
+                  gradient: LinearGradient(
+                    begin: Alignment.topCenter,
+                    end: Alignment.bottomCenter,
+                    colors: [
+                      Colors.black.withOpacity(0.0),
+                      Colors.black.withOpacity(0.0),
+                      Colors.black.withOpacity(0.85),
+                    ],
+                  ),
+                ),
+              ),
+              Positioned(
+                top: 10,
+                right: 10,
+                child: InkResponse(
+                  onTap: onRemove,
+                  radius: 18,
+                  child: Container(
+                    width: 32,
+                    height: 32,
+                    decoration: BoxDecoration(
+                      color: Colors.black.withOpacity(0.55),
+                      borderRadius: BorderRadius.circular(16),
+                      border: Border.all(color: Colors.white12),
+                    ),
+                    child: const Icon(Icons.close, color: Colors.white, size: 18),
+                  ),
+                ),
+              ),
+              if (score != null)
+                Positioned(
+                  top: 10,
+                  left: 10,
+                  child: Container(
+                    padding:
+                        const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+                    decoration: BoxDecoration(
+                      color: Colors.black.withOpacity(0.55),
+                      borderRadius: BorderRadius.circular(10),
+                      border: Border.all(color: Colors.white12),
+                    ),
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        const Icon(Icons.star_rounded,
+                            color: Colors.amber, size: 16),
+                        const SizedBox(width: 4),
+                        Text(
+                          score.toStringAsFixed(1),
+                          style: const TextStyle(
+                              color: Colors.white, fontSize: 12),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              Positioned(
+                left: 12,
+                right: 12,
+                bottom: 12,
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      title,
+                      maxLines: 2,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(
+                        color: Colors.white,
+                        fontSize: 14,
+                        fontWeight: FontWeight.w700,
+                        height: 1.15,
+                      ),
+                    ),
+                    const SizedBox(height: 4),
+                    Text(
+                      year,
+                      style: const TextStyle(
+                          color: Colors.white70, fontSize: 12),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
 class ProfileScreen extends StatelessWidget {
   const ProfileScreen({super.key});
 
@@ -2608,13 +5174,22 @@ class ProfileScreen extends StatelessWidget {
               onPressed: () => Navigator.of(dialogCtx).pop(),
               child: const Text('Cancel')),
           ElevatedButton(
-            onPressed: () {
+            onPressed: () async {
               Navigator.of(dialogCtx).pop();
+              try {
+                await AuthService().signOut();
+              } catch (_) {
+                // Ignore server logout failures; still clear local state.
+              }
+              await StorageService.clearUser();
               isLoggedIn.value = false;
               currentUserInfo.value = null;
-              ScaffoldMessenger.of(context)
-                  .showSnackBar(const SnackBar(content: Text('Logged out')));
-              context.go('/');
+              unawaited(refreshSavedMoviesForCurrentUser());
+              if (context.mounted) {
+                ScaffoldMessenger.of(context)
+                    .showSnackBar(const SnackBar(content: Text('Logged out')));
+                context.go('/');
+              }
             },
             style: ElevatedButton.styleFrom(backgroundColor: Colors.red),
             child: const Text('Log out'),
@@ -2626,70 +5201,353 @@ class ProfileScreen extends StatelessWidget {
 
   void _showEditProfileDialog(BuildContext context) {
     final info = currentUserInfo.value ?? {};
-    final nameCtrl = TextEditingController(text: info['userName'] ?? '');
-    String gender = info['gender'] ?? 'other';
-    final bioCtrl = TextEditingController(text: info['bio'] ?? '');
+    final userId = int.tryParse(info['userID'] ?? '');
+    if (userId == null || userId <= 0) {
+      ScaffoldMessenger.of(context)
+          .showSnackBar(const SnackBar(content: Text('Please sign in again.')));
+      return;
+    }
+
+    final userService = UserService();
+
+    final usernameCtrl = TextEditingController(text: info['userName'] ?? '');
+    final firstNameCtrl = TextEditingController(text: info['firstName'] ?? '');
+    final lastNameCtrl = TextEditingController(text: info['lastName'] ?? '');
+
+    String gender = (info['gender'] ?? 'other').toString().toLowerCase();
+    if (!['male', 'female', 'other'].contains(gender)) gender = 'other';
+
+    DateTime? dateOfBirth = DateTime.tryParse(info['dateOfBirth'] ?? '');
+    XFile? avatarFile;
+    Uint8List? avatarBytes;
+
+    bool saving = false;
+    String? error;
+
+    Future<void> pickAvatar(void Function(void Function()) setState) async {
+      final file = await ImagePicker().pickImage(
+        source: ImageSource.gallery,
+        imageQuality: 85,
+      );
+      if (file == null) return;
+      final bytes = await file.readAsBytes();
+      setState(() {
+        avatarFile = file;
+        avatarBytes = bytes;
+      });
+    }
+
+    Future<void> pickDob(void Function(void Function()) setState, BuildContext ctx) async {
+      final now = DateTime.now();
+      final initial = dateOfBirth ?? DateTime(now.year - 18, now.month, now.day);
+      final picked = await showDatePicker(
+        context: ctx,
+        initialDate: initial,
+        firstDate: DateTime(1900),
+        lastDate: now,
+      );
+      if (picked == null) return;
+      setState(() => dateOfBirth = picked);
+    }
 
     showDialog(
       context: context,
-      builder: (_) => AlertDialog(
-        backgroundColor: Colors.grey[900],
-        title:
-            const Text('Edit Profile', style: TextStyle(color: Colors.white)),
-        content: SizedBox(
-          width: 420,
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              TextField(
-                controller: nameCtrl,
-                style: const TextStyle(color: Colors.white),
-                decoration: const InputDecoration(labelText: 'Display Name'),
-              ),
-              const SizedBox(height: 8),
-              DropdownButtonFormField<String>(
-                value: gender.isNotEmpty ? gender : 'other',
-                items: const [
-                  DropdownMenuItem(value: 'male', child: Text('Male')),
-                  DropdownMenuItem(value: 'female', child: Text('Female')),
-                  DropdownMenuItem(value: 'other', child: Text('Other')),
+      builder: (dialogCtx) => StatefulBuilder(
+        builder: (dialogCtx, setState) {
+          final avatarUrl = cacheBustUrl(
+            resolveApiUrl(info['avatar']),
+            cacheKey: avatarCacheBuster.value,
+          );
+          final hasNetworkAvatar = avatarBytes == null && avatarUrl.isNotEmpty;
+          final dobLabel = dateOfBirth == null
+              ? 'Not set'
+              : DateFormat('yyyy-MM-dd').format(dateOfBirth!);
+
+          return AlertDialog(
+            backgroundColor: Colors.grey[900],
+            title: const Text('Edit Profile', style: TextStyle(color: Colors.white)),
+            content: SizedBox(
+              width: 460,
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Row(
+                    children: [
+                      CircleAvatar(
+                        radius: 26,
+                        backgroundColor: Colors.red,
+                        backgroundImage: avatarBytes != null
+                            ? MemoryImage(avatarBytes!)
+                            : (hasNetworkAvatar ? NetworkImage(avatarUrl) : null)
+                                as ImageProvider<Object>?,
+                        child: (avatarBytes == null && !hasNetworkAvatar)
+                            ? Text(
+                                (usernameCtrl.text.isNotEmpty
+                                        ? usernameCtrl.text[0].toUpperCase()
+                                        : 'U'),
+                                style: const TextStyle(
+                                    color: Colors.white, fontWeight: FontWeight.w700),
+                              )
+                            : null,
+                      ),
+                      const SizedBox(width: 12),
+                      OutlinedButton.icon(
+                        onPressed: saving ? null : () => pickAvatar(setState),
+                        icon: const Icon(Icons.photo_camera),
+                        label: const Text('Change Photo'),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 12),
+                  TextField(
+                    controller: usernameCtrl,
+                    style: const TextStyle(color: Colors.white),
+                    decoration: const InputDecoration(labelText: 'Username'),
+                  ),
+                  const SizedBox(height: 8),
+                  Row(
+                    children: [
+                      Expanded(
+                        child: TextField(
+                          controller: firstNameCtrl,
+                          style: const TextStyle(color: Colors.white),
+                          decoration: const InputDecoration(labelText: 'First name'),
+                        ),
+                      ),
+                      const SizedBox(width: 12),
+                      Expanded(
+                        child: TextField(
+                          controller: lastNameCtrl,
+                          style: const TextStyle(color: Colors.white),
+                          decoration: const InputDecoration(labelText: 'Last name'),
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 8),
+                  DropdownButtonFormField<String>(
+                    value: gender,
+                    items: const [
+                      DropdownMenuItem(value: 'male', child: Text('Male')),
+                      DropdownMenuItem(value: 'female', child: Text('Female')),
+                      DropdownMenuItem(value: 'other', child: Text('Other')),
+                    ],
+                    onChanged: saving ? null : (v) => setState(() => gender = v ?? 'other'),
+                    dropdownColor: Colors.black,
+                    style: const TextStyle(color: Colors.white),
+                    decoration: const InputDecoration(labelText: 'Gender'),
+                  ),
+                  const SizedBox(height: 8),
+                  Row(
+                    children: [
+                      Expanded(
+                        child: Text('Date of birth: $dobLabel',
+                            style: const TextStyle(color: Colors.white70)),
+                      ),
+                      OutlinedButton(
+                        onPressed: saving ? null : () => pickDob(setState, dialogCtx),
+                        child: const Text('Pick'),
+                      ),
+                    ],
+                  ),
+                  if (error != null) ...[
+                    const SizedBox(height: 8),
+                    Text(error!, style: const TextStyle(color: Colors.red)),
+                  ],
                 ],
-                onChanged: (v) => gender = v ?? 'other',
-                dropdownColor: Colors.black,
-                style: const TextStyle(color: Colors.white),
-                decoration: const InputDecoration(labelText: 'Gender'),
               ),
-              const SizedBox(height: 8),
-              TextField(
-                controller: bioCtrl,
-                style: const TextStyle(color: Colors.white),
-                decoration: const InputDecoration(labelText: 'Bio'),
-                maxLines: 3,
+            ),
+            actions: [
+              TextButton(
+                onPressed: saving ? null : () => Navigator.of(dialogCtx).pop(),
+                child: const Text('Cancel'),
+              ),
+              FilledButton(
+                onPressed: saving
+                    ? null
+                    : () async {
+                        final newUsername = usernameCtrl.text.trim();
+                        final firstName = firstNameCtrl.text.trim();
+                        final lastName = lastNameCtrl.text.trim();
+
+                        if (newUsername.isEmpty) {
+                          setState(() => error = 'Username is required');
+                          return;
+                        }
+
+                        setState(() {
+                          saving = true;
+                          error = null;
+                        });
+
+                        try {
+                          final oldUsername = (info['userName'] ?? '').toString();
+                          if (oldUsername.isNotEmpty && newUsername != oldUsername) {
+                            await userService.updateUsername(
+                              userId: userId,
+                              newUsername: newUsername,
+                            );
+                          }
+
+                          final shouldUpdateProfile =
+                              avatarFile != null ||
+                              firstName != (info['firstName'] ?? '').toString() ||
+                              lastName != (info['lastName'] ?? '').toString() ||
+                              gender != (info['gender'] ?? 'other').toString().toLowerCase() ||
+                              (dateOfBirth?.toIso8601String() != DateTime.tryParse(info['dateOfBirth'] ?? '')?.toIso8601String());
+
+                          if (shouldUpdateProfile) {
+                            await userService.updateProfileMultipart(
+                              userId: userId,
+                              newUserName: newUsername,
+                              firstName: firstName,
+                              lastName: lastName,
+                              gender: gender,
+                              dateOfBirth: dateOfBirth,
+                              avatar: avatarFile,
+                            );
+                          }
+
+                          // Refresh from /user/me
+                          try {
+                            final me = await userService.getMe();
+                            final profile = (me['profile'] is Map)
+                                ? Map<String, dynamic>.from(me['profile'] as Map)
+                                : <String, dynamic>{};
+                            final meUserName = (me['userName'] ?? '').toString();
+                            final meEmail = (me['email'] ?? '').toString();
+                            final meId = (me['userID'] ?? me['userId'] ?? '').toString();
+                            currentUserInfo.value = {
+                              'userName': meUserName.isNotEmpty ? meUserName : newUsername,
+                              'email': meEmail.isNotEmpty ? meEmail : (info['email'] ?? '').toString(),
+                              if (meId.isNotEmpty) 'userID': meId,
+                              'firstName': (me['firstName'] ?? profile['firstName'] ?? firstName).toString(),
+                              'lastName': (me['lastName'] ?? profile['lastName'] ?? lastName).toString(),
+                              if (((me['avatar'] ?? profile['avatar'])?.toString() ?? '').isNotEmpty)
+                                'avatar': (me['avatar'] ?? profile['avatar']).toString(),
+                              if (((me['gender'] ?? profile['gender'])?.toString() ?? '').isNotEmpty)
+                                'gender': (me['gender'] ?? profile['gender']).toString(),
+                              if (((me['dateOfBirth'] ?? profile['dateOfBirth'])?.toString() ?? '').isNotEmpty)
+                                'dateOfBirth': (me['dateOfBirth'] ?? profile['dateOfBirth']).toString(),
+                            };
+                            isLoggedIn.value = true;
+                          } catch (_) {
+                            currentUserInfo.value = {
+                              ...info.map((k, v) => MapEntry(k, v?.toString() ?? '')),
+                              'userName': newUsername,
+                              'firstName': firstName,
+                              'lastName': lastName,
+                              'gender': gender,
+                              if (dateOfBirth != null) 'dateOfBirth': dateOfBirth!.toIso8601String(),
+                            };
+                          }
+
+                          if (dialogCtx.mounted) Navigator.of(dialogCtx).pop();
+                          ScaffoldMessenger.of(context).showSnackBar(
+                              const SnackBar(content: Text('Profile updated')));
+                        } catch (e) {
+                          setState(() => error = e.toString());
+                        } finally {
+                          setState(() => saving = false);
+                        }
+                      },
+                child: saving
+                    ? const SizedBox(
+                        width: 18,
+                        height: 18,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      )
+                    : const Text('Save'),
+              )
+            ],
+          );
+        },
+      ),
+    );
+  }
+
+  void _confirmDeleteAccount(BuildContext context) {
+    final info = currentUserInfo.value;
+    final userId = int.tryParse(info?['userID'] ?? '');
+    if (userId == null || userId <= 0) {
+      ScaffoldMessenger.of(context)
+          .showSnackBar(const SnackBar(content: Text('Please sign in again.')));
+      return;
+    }
+
+    bool deleting = false;
+    String? error;
+    final userService = UserService();
+
+    showDialog(
+      context: context,
+      builder: (dialogCtx) => StatefulBuilder(
+        builder: (dialogCtx, setState) {
+          return AlertDialog(
+            backgroundColor: Colors.grey[900],
+            title: const Text('Delete account', style: TextStyle(color: Colors.white)),
+            content: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text('This action cannot be undone.',
+                    style: TextStyle(color: Colors.white70)),
+                const SizedBox(height: 8),
+                Text('User: ${info?['userName'] ?? ''}',
+                    style: const TextStyle(color: Colors.white70)),
+                if (error != null) ...[
+                  const SizedBox(height: 8),
+                  Text(error!, style: const TextStyle(color: Colors.red)),
+                ],
+              ],
+            ),
+            actions: [
+              TextButton(
+                onPressed: deleting ? null : () => Navigator.of(dialogCtx).pop(),
+                child: const Text('Cancel'),
+              ),
+              ElevatedButton(
+                onPressed: deleting
+                    ? null
+                    : () async {
+                        setState(() {
+                          deleting = true;
+                          error = null;
+                        });
+                        try {
+                          await userService.deleteAccount(userId: userId);
+                          Navigator.of(dialogCtx).pop();
+                          try {
+                            await AuthService().signOut();
+                          } catch (_) {}
+                          await StorageService.clearUser();
+                          isLoggedIn.value = false;
+                          currentUserInfo.value = null;
+                          unawaited(refreshSavedMoviesForCurrentUser());
+                          if (context.mounted) {
+                            ScaffoldMessenger.of(context).showSnackBar(
+                                const SnackBar(content: Text('Account deleted')));
+                            context.go('/');
+                          }
+                        } catch (e) {
+                          setState(() {
+                            error = e.toString();
+                            deleting = false;
+                          });
+                        }
+                      },
+                style: ElevatedButton.styleFrom(backgroundColor: Colors.red),
+                child: deleting
+                    ? const SizedBox(
+                        width: 18,
+                        height: 18,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      )
+                    : const Text('Delete Account'),
               ),
             ],
-          ),
-        ),
-        actions: [
-          TextButton(
-              onPressed: () => Navigator.of(context).pop(),
-              child: const Text('Cancel')),
-          FilledButton(
-            onPressed: () {
-              final updated = {
-                ...info,
-                'userName': nameCtrl.text.trim(),
-                'gender': gender,
-                'bio': bioCtrl.text.trim(),
-              };
-              currentUserInfo.value = Map<String, String>.from(
-                  updated.map((k, v) => MapEntry(k, v?.toString() ?? '')));
-              Navigator.of(context).pop();
-              ScaffoldMessenger.of(context).showSnackBar(
-                  const SnackBar(content: Text('Profile updated')));
-            },
-            child: const Text('Save'),
-          )
-        ],
+          );
+        },
       ),
     );
   }
@@ -2729,6 +5587,10 @@ class ProfileScreen extends StatelessWidget {
             final name = info?['userName'] ?? 'Guest';
             final email = info?['email'] ?? 'Not signed in';
             final gender = info?['gender'] ?? '—';
+            final avatarUrl = cacheBustUrl(
+              resolveApiUrl(info?['avatar']),
+              cacheKey: avatarCacheBuster.value,
+            );
             return TabBarView(
               children: [
                 // Overview
@@ -2747,14 +5609,19 @@ class ProfileScreen extends StatelessWidget {
                                 CircleAvatar(
                                   radius: 36,
                                   backgroundColor: Colors.red,
-                                  child: Text(
+                                  backgroundImage:
+                                    avatarUrl.isNotEmpty ? NetworkImage(avatarUrl) : null,
+                                  child: avatarUrl.isNotEmpty
+                                    ? null
+                                    : Text(
                                       name.isNotEmpty
-                                          ? name[0].toUpperCase()
-                                          : 'U',
+                                        ? name[0].toUpperCase()
+                                        : 'U',
                                       style: const TextStyle(
-                                          color: Colors.white,
-                                          fontSize: 20,
-                                          fontWeight: FontWeight.bold)),
+                                        color: Colors.white,
+                                        fontSize: 20,
+                                        fontWeight: FontWeight.bold),
+                                    ),
                                 ),
                                 const SizedBox(width: 16),
                                 Expanded(
@@ -2782,17 +5649,10 @@ class ProfileScreen extends StatelessWidget {
                         const SizedBox(height: 16),
                         Card(
                           color: Colors.grey[900],
-                          child: const Padding(
-                            padding: EdgeInsets.all(16),
-                            child: Column(
-                              crossAxisAlignment: CrossAxisAlignment.start,
-                              children: [
-                                Text('Latest Comments',
-                                    style:
-                                        TextStyle(fontWeight: FontWeight.w700)),
-                                SizedBox(height: 8),
-                                Text('Coming soon'),
-                              ],
+                          child: Padding(
+                            padding: const EdgeInsets.all(16),
+                            child: _LatestCommentsCard(
+                              userId: int.tryParse(info?['userID'] ?? ''),
                             ),
                           ),
                         ),
@@ -2807,23 +5667,8 @@ class ProfileScreen extends StatelessWidget {
                     child: ListView(
                       padding: const EdgeInsets.all(24),
                       children: [
-                        Card(
-                          elevation: 0,
-                          child: Padding(
-                            padding: const EdgeInsets.all(12),
-                            child: Wrap(
-                              spacing: 12,
-                              runSpacing: 12,
-                              children: [
-                                FilledButton.icon(
-                                  onPressed: () =>
-                                      _showEditProfileDialog(context),
-                                  icon: const Icon(Icons.edit),
-                                  label: const Text('Edit Profile'),
-                                ),
-                              ],
-                            ),
-                          ),
+                        _InlineProfileEditorCard(
+                          key: ValueKey(info?['userID'] ?? 'guest'),
                         ),
                         const SizedBox(height: 12),
                         Card(
@@ -2856,7 +5701,7 @@ class ProfileScreen extends StatelessWidget {
                                         TextStyle(fontWeight: FontWeight.w700)),
                                 const SizedBox(height: 8),
                                 OutlinedButton.icon(
-                                  onPressed: () {},
+                                  onPressed: () => _confirmDeleteAccount(context),
                                   icon: const Icon(Icons.delete_forever,
                                       color: Colors.red),
                                   label: const Text('Delete Account'),
@@ -2906,6 +5751,585 @@ class ProfileScreen extends StatelessWidget {
   }
 }
 
+class _InlineProfileEditorCard extends StatefulWidget {
+  const _InlineProfileEditorCard({super.key});
+
+  @override
+  State<_InlineProfileEditorCard> createState() => _InlineProfileEditorCardState();
+}
+
+class _InlineProfileEditorCardState extends State<_InlineProfileEditorCard> {
+  final _userService = UserService();
+
+  late final TextEditingController _usernameCtrl;
+  late final TextEditingController _firstNameCtrl;
+  late final TextEditingController _lastNameCtrl;
+
+  String _gender = 'other';
+  DateTime? _dateOfBirth;
+  XFile? _avatarFile;
+  Uint8List? _avatarBytes;
+  String? _avatarCacheKey;
+
+  bool _saving = false;
+  String? _error;
+
+  Map<String, String> _lastInfo = const <String, String>{};
+  late final VoidCallback _infoListener;
+
+  void _syncFromInfo(Map<String, String> info, {required Map<String, String> oldInfo}) {
+    // Avoid clobbering unsaved edits.
+    if (_usernameCtrl.text == (oldInfo['userName'] ?? '')) {
+      _usernameCtrl.text = info['userName'] ?? '';
+    }
+    if (_firstNameCtrl.text == (oldInfo['firstName'] ?? '')) {
+      _firstNameCtrl.text = info['firstName'] ?? '';
+    }
+    if (_lastNameCtrl.text == (oldInfo['lastName'] ?? '')) {
+      _lastNameCtrl.text = info['lastName'] ?? '';
+    }
+
+    final oldGender = (oldInfo['gender'] ?? 'other').toString().toLowerCase();
+    if (_gender == oldGender) {
+      _gender = (info['gender'] ?? 'other').toString().toLowerCase();
+      if (!['male', 'female', 'other'].contains(_gender)) _gender = 'other';
+    }
+
+    final oldDob = DateTime.tryParse(oldInfo['dateOfBirth'] ?? '');
+    if (_dateOfBirth?.toIso8601String() == oldDob?.toIso8601String()) {
+      _dateOfBirth = DateTime.tryParse(info['dateOfBirth'] ?? '');
+    }
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    final info = currentUserInfo.value ?? const <String, String>{};
+    _lastInfo = Map<String, String>.from(info);
+    _usernameCtrl = TextEditingController(text: info['userName'] ?? '');
+    _firstNameCtrl = TextEditingController(text: info['firstName'] ?? '');
+    _lastNameCtrl = TextEditingController(text: info['lastName'] ?? '');
+
+    _gender = (info['gender'] ?? 'other').toString().toLowerCase();
+    if (!['male', 'female', 'other'].contains(_gender)) _gender = 'other';
+    _dateOfBirth = DateTime.tryParse(info['dateOfBirth'] ?? '');
+
+    // Keep form in sync when currentUserInfo is refreshed from /user/me.
+    _infoListener = () {
+      if (!mounted) return;
+      final infoNow = currentUserInfo.value ?? const <String, String>{};
+      final oldInfo = _lastInfo;
+
+      final didUserChange = (oldInfo['userID'] ?? '') != (infoNow['userID'] ?? '');
+      final didRelevantChange =
+          didUserChange ||
+          oldInfo['userName'] != infoNow['userName'] ||
+          oldInfo['firstName'] != infoNow['firstName'] ||
+          oldInfo['lastName'] != infoNow['lastName'] ||
+          oldInfo['gender'] != infoNow['gender'] ||
+          oldInfo['dateOfBirth'] != infoNow['dateOfBirth'] ||
+          oldInfo['avatar'] != infoNow['avatar'];
+
+      if (!didRelevantChange) return;
+
+      // Update snapshot early to avoid loops.
+      _lastInfo = Map<String, String>.from(infoNow);
+
+      if (_saving) {
+        setState(() {});
+        return;
+      }
+
+      if (didUserChange) {
+        _avatarFile = null;
+        _avatarBytes = null;
+        _error = null;
+      }
+
+      if (oldInfo['avatar'] != infoNow['avatar']) {
+        avatarCacheBuster.value = DateTime.now().millisecondsSinceEpoch.toString();
+      }
+
+      _syncFromInfo(infoNow, oldInfo: oldInfo);
+      setState(() {});
+    };
+    currentUserInfo.addListener(_infoListener);
+  }
+
+  @override
+  void dispose() {
+    currentUserInfo.removeListener(_infoListener);
+    _usernameCtrl.dispose();
+    _firstNameCtrl.dispose();
+    _lastNameCtrl.dispose();
+    super.dispose();
+  }
+
+  Future<void> _pickAvatar() async {
+    final file = await ImagePicker().pickImage(
+      source: ImageSource.gallery,
+      imageQuality: 85,
+    );
+    if (file == null) return;
+    final bytes = await file.readAsBytes();
+    setState(() {
+      _avatarFile = file;
+      _avatarBytes = bytes;
+    });
+  }
+
+  Future<void> _pickDob() async {
+    final now = DateTime.now();
+    final initial = _dateOfBirth ?? DateTime(now.year - 18, now.month, now.day);
+    final picked = await showDatePicker(
+      context: context,
+      initialDate: initial,
+      firstDate: DateTime(1900),
+      lastDate: now,
+    );
+    if (picked == null) return;
+    setState(() => _dateOfBirth = picked);
+  }
+
+  Future<void> _save() async {
+    final info = currentUserInfo.value ?? const <String, String>{};
+    final userId = int.tryParse(info['userID'] ?? '');
+    if (userId == null || userId <= 0) {
+      ScaffoldMessenger.of(context)
+          .showSnackBar(const SnackBar(content: Text('Please sign in again.')));
+      return;
+    }
+
+    final newUsername = _usernameCtrl.text.trim();
+    final firstName = _firstNameCtrl.text.trim();
+    final lastName = _lastNameCtrl.text.trim();
+
+    if (newUsername.isEmpty) {
+      setState(() => _error = 'Username is required');
+      return;
+    }
+
+    setState(() {
+      _saving = true;
+      _error = null;
+    });
+
+    try {
+      final oldUsername = (info['userName'] ?? '').toString();
+      if (oldUsername.isNotEmpty && newUsername != oldUsername) {
+        await _userService.updateUsername(userId: userId, newUsername: newUsername);
+      }
+
+      final oldDob = DateTime.tryParse(info['dateOfBirth'] ?? '');
+      final shouldUpdateProfile =
+          _avatarFile != null ||
+          firstName != (info['firstName'] ?? '') ||
+          lastName != (info['lastName'] ?? '') ||
+          _gender != (info['gender'] ?? 'other').toString().toLowerCase() ||
+          (_dateOfBirth?.toIso8601String() != oldDob?.toIso8601String());
+
+      if (shouldUpdateProfile) {
+        await _userService.updateProfileMultipart(
+          userId: userId,
+          newUserName: newUsername,
+          firstName: firstName,
+          lastName: lastName,
+          gender: _gender,
+          dateOfBirth: _dateOfBirth,
+          avatar: _avatarFile,
+        );
+
+        if (_avatarFile != null) {
+          _avatarCacheKey = DateTime.now().millisecondsSinceEpoch.toString();
+          avatarCacheBuster.value = _avatarCacheKey!;
+        }
+      }
+
+      // Refresh from /user/me to keep UI consistent with backend
+      try {
+        final me = await _userService.getMe();
+        final profile = (me['profile'] is Map)
+            ? Map<String, dynamic>.from(me['profile'] as Map)
+            : <String, dynamic>{};
+        final meUserName = (me['userName'] ?? '').toString();
+        final meEmail = (me['email'] ?? '').toString();
+        final meId = (me['userID'] ?? me['userId'] ?? '').toString();
+
+        currentUserInfo.value = {
+          'userName': meUserName.isNotEmpty ? meUserName : newUsername,
+          'email': meEmail.isNotEmpty ? meEmail : (info['email'] ?? '').toString(),
+          if (meId.isNotEmpty) 'userID': meId,
+          'firstName': (me['firstName'] ?? profile['firstName'] ?? firstName).toString(),
+          'lastName': (me['lastName'] ?? profile['lastName'] ?? lastName).toString(),
+          if (((me['avatar'] ?? profile['avatar'])?.toString() ?? '').isNotEmpty)
+            'avatar': (me['avatar'] ?? profile['avatar']).toString(),
+          if (((me['gender'] ?? profile['gender'])?.toString() ?? '').isNotEmpty)
+            'gender': (me['gender'] ?? profile['gender']).toString(),
+          if (((me['dateOfBirth'] ?? profile['dateOfBirth'])?.toString() ?? '').isNotEmpty)
+            'dateOfBirth': (me['dateOfBirth'] ?? profile['dateOfBirth']).toString(),
+        };
+        isLoggedIn.value = true;
+      } catch (_) {
+        currentUserInfo.value = {
+          ...info.map((k, v) => MapEntry(k, v?.toString() ?? '')),
+          'userName': newUsername,
+          'firstName': firstName,
+          'lastName': lastName,
+          'gender': _gender,
+          if (_dateOfBirth != null) 'dateOfBirth': _dateOfBirth!.toIso8601String(),
+        };
+      }
+
+      if (mounted) {
+        ScaffoldMessenger.of(context)
+            .showSnackBar(const SnackBar(content: Text('Profile updated')));
+      }
+    } catch (e) {
+      if (mounted) setState(() => _error = e.toString());
+    } finally {
+      if (mounted) setState(() => _saving = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final info = currentUserInfo.value ?? const <String, String>{};
+    final avatarUrl = cacheBustUrl(
+      resolveApiUrl(info['avatar']),
+      cacheKey: _avatarCacheKey,
+    );
+    final hasNetworkAvatar = _avatarBytes == null && avatarUrl.isNotEmpty;
+    final dobLabel = _dateOfBirth == null
+        ? 'Not set'
+        : DateFormat('yyyy-MM-dd').format(_dateOfBirth!);
+
+    return Card(
+      elevation: 0,
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text('Profile', style: TextStyle(fontWeight: FontWeight.w800)),
+            const SizedBox(height: 12),
+            Row(
+              children: [
+                CircleAvatar(
+                  radius: 28,
+                  backgroundColor: Colors.red,
+                  backgroundImage: _avatarBytes != null
+                      ? MemoryImage(_avatarBytes!)
+                      : (hasNetworkAvatar ? NetworkImage(avatarUrl) : null)
+                          as ImageProvider<Object>?,
+                  child: (_avatarBytes == null && !hasNetworkAvatar)
+                      ? Text(
+                          (info['userName'] ?? 'U').isNotEmpty
+                              ? (info['userName'] ?? 'U')![0].toUpperCase()
+                              : 'U',
+                          style: const TextStyle(
+                              color: Colors.white, fontWeight: FontWeight.w700),
+                        )
+                      : null,
+                ),
+                const SizedBox(width: 12),
+                OutlinedButton.icon(
+                  onPressed: _saving ? null : _pickAvatar,
+                  icon: const Icon(Icons.photo_camera),
+                  label: const Text('Change Photo'),
+                ),
+                const Spacer(),
+                FilledButton(
+                  onPressed: _saving ? null : _save,
+                  child: _saving
+                      ? const SizedBox(
+                          width: 18,
+                          height: 18,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        )
+                      : const Text('Save'),
+                ),
+              ],
+            ),
+            const SizedBox(height: 12),
+            TextField(
+              controller: _usernameCtrl,
+              decoration: const InputDecoration(labelText: 'Username'),
+              enabled: !_saving,
+            ),
+            const SizedBox(height: 8),
+            Row(
+              children: [
+                Expanded(
+                  child: TextField(
+                    controller: _firstNameCtrl,
+                    decoration: const InputDecoration(labelText: 'First name'),
+                    enabled: !_saving,
+                  ),
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: TextField(
+                    controller: _lastNameCtrl,
+                    decoration: const InputDecoration(labelText: 'Last name'),
+                    enabled: !_saving,
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 8),
+            DropdownButtonFormField<String>(
+              value: _gender,
+              items: const [
+                DropdownMenuItem(value: 'male', child: Text('Male')),
+                DropdownMenuItem(value: 'female', child: Text('Female')),
+                DropdownMenuItem(value: 'other', child: Text('Other')),
+              ],
+              onChanged: _saving ? null : (v) => setState(() => _gender = v ?? 'other'),
+              decoration: const InputDecoration(labelText: 'Gender'),
+            ),
+            const SizedBox(height: 8),
+            Row(
+              children: [
+                Expanded(
+                  child: Text('Date of birth: $dobLabel',
+                      style: const TextStyle(color: Colors.white70)),
+                ),
+                OutlinedButton(
+                  onPressed: _saving ? null : _pickDob,
+                  child: const Text('Pick'),
+                ),
+              ],
+            ),
+            if (_error != null) ...[
+              const SizedBox(height: 8),
+              Text(_error!, style: const TextStyle(color: Colors.red)),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _LatestCommentsCard extends StatefulWidget {
+  final int? userId;
+
+  const _LatestCommentsCard({required this.userId});
+
+  @override
+  State<_LatestCommentsCard> createState() => _LatestCommentsCardState();
+}
+
+class _LatestCommentsCardState extends State<_LatestCommentsCard> {
+  bool _loading = false;
+  String? _error;
+  List<CommentDemo> _comments = const [];
+  final Map<int, String> _movieTitles = <int, String>{};
+
+  @override
+  void initState() {
+    super.initState();
+
+    for (final m in appMovies) {
+      _movieTitles[m.id] = m.title;
+    }
+
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _load();
+    });
+  }
+
+  @override
+  void didUpdateWidget(covariant _LatestCommentsCard oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.userId != widget.userId) {
+      _load();
+    }
+  }
+
+  Future<String?> _fetchMovieTitle(int movieId) async {
+    try {
+      final uri =
+          Uri.parse('${AppConstants.baseApiUrl}/api/Movie/GetMovieById/$movieId');
+      final res = await _httpClient.get(uri, headers: _authHeaders());
+      if (res.statusCode != 200) return null;
+
+      final decoded = jsonDecode(res.body);
+      final data = _unwrapResponseData(decoded);
+      if (data is! Map) return null;
+      final map = Map<String, dynamic>.from(data as Map);
+
+      final title = (map['title'] as String?) ??
+          (map['originalTitle'] as String?) ??
+          (map['name'] as String?);
+      if (title == null || title.trim().isEmpty) return null;
+      return title.trim();
+    } catch (_) {
+      return null;
+    }
+  }
+
+  Future<void> _load() async {
+    final userId = widget.userId;
+    if (userId == null || userId <= 0) {
+      if (!mounted) return;
+      setState(() {
+        _loading = false;
+        _error = 'Please sign in to view your comments';
+        _comments = const [];
+      });
+      return;
+    }
+
+    setState(() {
+      _loading = true;
+      _error = null;
+    });
+
+    try {
+      final uri = Uri.parse(
+          '${AppConstants.baseApiUrl}/api/Comment/GetCommentsByUserID/$userId?userID=$userId');
+      final res = await _httpClient.get(uri, headers: _authHeaders());
+
+      if (res.statusCode == 401) throw Exception('HTTP_401');
+      if (res.statusCode == 403) throw Exception('HTTP_403');
+      if (res.statusCode != 200) {
+        throw Exception(
+            'Failed to fetch comments (HTTP ${res.statusCode}): ${_previewBody(res.body)}');
+      }
+
+      final decoded = jsonDecode(res.body);
+      final data = _unwrapResponseData(decoded);
+      if (data is! List) {
+        throw Exception('Comments returned unexpected shape');
+      }
+
+      final list = <CommentDemo>[];
+      for (final item in data) {
+        if (item is Map<String, dynamic>) {
+          list.add(CommentDemo.fromJson(item));
+        } else if (item is Map) {
+          list.add(CommentDemo.fromJson(Map<String, dynamic>.from(item as Map)));
+        }
+      }
+      list.sort((a, b) => b.createdAt.compareTo(a.createdAt));
+
+      // Hydrate movie titles for the first 5 comments.
+      final top = list.take(5).toList();
+      final uniqueMovieIds = top.map((c) => c.movieID).toSet();
+      for (final movieId in uniqueMovieIds) {
+        if (movieId <= 0) continue;
+        if (_movieTitles.containsKey(movieId)) continue;
+        final title = await _fetchMovieTitle(movieId);
+        if (title != null) {
+          _movieTitles[movieId] = title;
+        }
+      }
+
+      if (!mounted) return;
+      setState(() {
+        _comments = list;
+        _loading = false;
+      });
+    } catch (e) {
+      if (!mounted) return;
+      final prompt = authzPromptFromError(e);
+      setState(() {
+        _loading = false;
+        if (prompt == AuthzPromptType.signIn) {
+          _error = 'Please sign in to view your comments';
+        } else if (prompt == AuthzPromptType.buyPlan) {
+          _error = 'Please buy a plan to view your comments';
+        } else {
+          _error = e.toString();
+        }
+        _comments = const [];
+      });
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final df = DateFormat('yyyy-MM-dd');
+    final totalCount = _comments.length;
+    final shown = _comments.take(5).toList();
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        const Text('Latest Comments',
+            style: TextStyle(fontWeight: FontWeight.w700)),
+        const SizedBox(height: 8),
+        if (_loading)
+          const Padding(
+            padding: EdgeInsets.symmetric(vertical: 8),
+            child: LinearProgressIndicator(),
+          )
+        else if (_error != null)
+          Text(_error!, style: const TextStyle(color: Colors.white70))
+        else if (shown.isEmpty)
+          const Text('No comments yet', style: TextStyle(color: Colors.white70))
+        else
+          ...shown.map((c) {
+            final movieTitle = _movieTitles[c.movieID] ?? 'Movie #${c.movieID}';
+            final dateStr = df.format(c.createdAt);
+            return InkWell(
+              onTap: c.movieID > 0 ? () => context.go('/movie/${c.movieID}') : null,
+              child: Padding(
+                padding: const EdgeInsets.symmetric(vertical: 10),
+                child: Row(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Row(
+                            children: [
+                              Expanded(
+                                child: Text(
+                                  movieTitle,
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: const TextStyle(
+                                      color: Colors.white,
+                                      fontWeight: FontWeight.w600),
+                                ),
+                              ),
+                              const SizedBox(width: 12),
+                              Text(dateStr,
+                                  style:
+                                      const TextStyle(color: Colors.white54)),
+                            ],
+                          ),
+                          const SizedBox(height: 6),
+                          Text(
+                            c.content.trim(),
+                            maxLines: 2,
+                            overflow: TextOverflow.ellipsis,
+                            style: const TextStyle(color: Colors.white70),
+                          ),
+                        ],
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    const Icon(Icons.chevron_right, color: Colors.white54),
+                  ],
+                ),
+              ),
+            );
+          }),
+        if (!_loading && _error == null && totalCount > 5)
+          Padding(
+            padding: const EdgeInsets.only(top: 8),
+            child: Text('Showing 5 of $totalCount comments',
+                style: const TextStyle(color: Colors.white54)),
+          ),
+      ],
+    );
+  }
+}
+
 class _SubscriptionSectionDemo extends StatefulWidget {
   const _SubscriptionSectionDemo();
 
@@ -2925,6 +6349,10 @@ class _SubscriptionSectionDemoState extends State<_SubscriptionSectionDemo> {
   final Map<String, Map<String, dynamic>> _planPriceInfo =
       {}; // planId -> { priceID, amount, currency, intervalUnit, intervalCount }
 
+  String? _selectedPlanId;
+  bool _showBillingHistory = false;
+  List<Map<String, dynamic>> _billingHistory = [];
+
   @override
   void initState() {
     super.initState();
@@ -2937,9 +6365,16 @@ class _SubscriptionSectionDemoState extends State<_SubscriptionSectionDemo> {
       _error = null;
     });
     try {
+      final token = StorageService.getUserToken();
+      final authHeaders = (token != null && token.isNotEmpty)
+          ? <String, String>{'Authorization': 'Bearer $token'}
+          : const <String, String>{};
+
       // Load prices
-      final pricesRes =
-          await http.get(Uri.parse('${AppConstants.baseApiUrl}/api/price/all'));
+      final pricesRes = await http.get(
+        Uri.parse('${AppConstants.baseApiUrl}/api/price/all'),
+        headers: authHeaders,
+      );
       List<dynamic> prices = [];
       if (pricesRes.statusCode >= 200 && pricesRes.statusCode < 300) {
         final body = json.decode(pricesRes.body);
@@ -2949,8 +6384,10 @@ class _SubscriptionSectionDemoState extends State<_SubscriptionSectionDemo> {
       }
 
       // Load plans
-      final plansRes =
-          await http.get(Uri.parse('${AppConstants.baseApiUrl}/api/plans/all'));
+      final plansRes = await http.get(
+        Uri.parse('${AppConstants.baseApiUrl}/api/plans/all'),
+        headers: authHeaders,
+      );
       List<dynamic> plansRaw = [];
       if (plansRes.statusCode >= 200 && plansRes.statusCode < 300) {
         final body = json.decode(plansRes.body);
@@ -3010,8 +6447,11 @@ class _SubscriptionSectionDemoState extends State<_SubscriptionSectionDemo> {
       final userIdStr = info?['userID'] ?? info?['userId'];
       final userId = int.tryParse(userIdStr ?? '');
       if (userId != null && userId > 0) {
-        final subsRes = await http.get(Uri.parse(
-            '${AppConstants.baseApiUrl}/api/payment/subscription/user/$userId'));
+        final subsRes = await http.get(
+          Uri.parse(
+              '${AppConstants.baseApiUrl}/api/payment/subscription/user/$userId'),
+          headers: authHeaders,
+        );
         if (subsRes.statusCode >= 200 && subsRes.statusCode < 300) {
           final body = json.decode(subsRes.body);
           final arr = body is Map<String, dynamic>
@@ -3029,8 +6469,11 @@ class _SubscriptionSectionDemoState extends State<_SubscriptionSectionDemo> {
             var planId = latest['planID'] ?? latest['planId'];
             if (planId == null && latest['priceID'] != null) {
               try {
-                final priceRes = await http.get(Uri.parse(
-                    '${AppConstants.baseApiUrl}/api/price/${latest['priceID']}'));
+                final priceRes = await http.get(
+                  Uri.parse(
+                      '${AppConstants.baseApiUrl}/api/price/${latest['priceID']}'),
+                  headers: authHeaders,
+                );
                 if (priceRes.statusCode >= 200 && priceRes.statusCode < 300) {
                   final pb = json.decode(priceRes.body);
                   final pdata = pb is Map<String, dynamic>
@@ -3045,8 +6488,10 @@ class _SubscriptionSectionDemoState extends State<_SubscriptionSectionDemo> {
             String planName = 'Current Plan';
             if (planId != null) {
               try {
-                final planRes = await http.get(Uri.parse(
-                    '${AppConstants.baseApiUrl}/api/plans/${planId}'));
+                final planRes = await http.get(
+                  Uri.parse('${AppConstants.baseApiUrl}/api/plans/${planId}'),
+                  headers: authHeaders,
+                );
                 if (planRes.statusCode >= 200 && planRes.statusCode < 300) {
                   final pb = json.decode(planRes.body);
                   final pdata = pb is Map<String, dynamic>
@@ -3075,8 +6520,34 @@ class _SubscriptionSectionDemoState extends State<_SubscriptionSectionDemo> {
               'expiry': expiry,
               'planId': planId?.toString(),
             };
+
+            _billingHistory = arr.map<Map<String, dynamic>>((it) {
+              final planNameHist = (it['planName'] ?? planName).toString();
+              final statusHist = (it['status'] ?? '').toString();
+              String date = '';
+              final rawDate = it['currentPeriodEnd'] ?? it['createdAt'] ?? it['created_at'];
+              if (rawDate != null) {
+                final dt = DateTime.tryParse(rawDate.toString());
+                if (dt != null) {
+                  date = '${dt.day.toString().padLeft(2, '0')}/${dt.month.toString().padLeft(2, '0')}/${dt.year}';
+                } else {
+                  date = rawDate.toString();
+                }
+              }
+              return {
+                'planName': planNameHist,
+                'status': statusHist,
+                'date': date,
+              };
+            }).toList();
           }
         }
+      }
+
+      if (_selectedPlanId == null) {
+        final current = _currentPlan?['planId']?.toString();
+        final hasCurrent = current != null && _plans.any((p) => p['id']?.toString() == current);
+        _selectedPlanId = hasCurrent ? current : (_plans.isNotEmpty ? _plans.first['id']?.toString() : null);
       }
     } catch (e) {
       _error = e.toString();
@@ -3101,11 +6572,12 @@ class _SubscriptionSectionDemoState extends State<_SubscriptionSectionDemo> {
     try {
       final token = StorageService.getUserToken();
       if (token == null || token.isEmpty) {
-        if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-              const SnackBar(content: Text('Please sign in to subscribe')));
-          context.go('/signin');
-        }
+        if (!mounted) return;
+        await showAuthzPromptDialog(
+          context,
+          type: AuthzPromptType.signIn,
+          onPrimary: () => context.go('/signin'),
+        );
         return;
       }
       final uri =
@@ -3121,11 +6593,18 @@ class _SubscriptionSectionDemoState extends State<_SubscriptionSectionDemo> {
           'AutoRenew': false,
         }),
       );
+      if (res.statusCode == 401) throw Exception('HTTP_401');
+      if (res.statusCode == 403) throw Exception('HTTP_403');
       if (res.statusCode < 200 || res.statusCode >= 300) {
         throw Exception('Checkout failed (${res.statusCode})');
       }
       final body = json.decode(res.body);
-      final payUrl = body['payUrl'] ?? body['PayUrl'];
+      final data = body is Map<String, dynamic> ? (body['data'] ?? body['Data']) : null;
+      final payUrl = (data is Map<String, dynamic>)
+          ? (data['paymentUrl'] ?? data['payUrl'] ?? data['url'])
+          : (body is Map<String, dynamic>
+              ? (body['paymentUrl'] ?? body['payUrl'] ?? body['PayUrl'] ?? body['url'])
+              : null);
       if (payUrl is String && payUrl.isNotEmpty) {
         await launchUrl(Uri.parse(payUrl),
             mode: LaunchMode.externalApplication);
@@ -3136,190 +6615,412 @@ class _SubscriptionSectionDemoState extends State<_SubscriptionSectionDemo> {
         throw Exception('Missing payment URL');
       }
     } catch (e) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(content: Text('Checkout error: ${e.toString()}')));
+      if (!mounted) return;
+      final prompt = authzPromptFromError(e);
+      if (prompt == AuthzPromptType.signIn) {
+        await showAuthzPromptDialog(
+          context,
+          type: AuthzPromptType.signIn,
+          onPrimary: () => context.go('/signin'),
+        );
+        return;
       }
+      if (prompt == AuthzPromptType.buyPlan) {
+        await showAuthzPromptDialog(
+          context,
+          type: AuthzPromptType.buyPlan,
+          onPrimary: () => context.go('/profile'),
+        );
+        return;
+      }
+
+      ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Checkout error: ${e.toString()}')));
     }
+  }
+
+  Widget _buildCurrentPlanCard(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
+
+    if (_loading && _currentPlan == null) {
+      return const _SubscriptionRedOutlinedCard(
+        child: Padding(
+          padding: EdgeInsets.all(18),
+          child: Center(child: CircularProgressIndicator(strokeWidth: 2)),
+        ),
+      );
+    }
+
+    if (_currentPlan == null) {
+      return const _SubscriptionRedOutlinedCard(
+        child: Padding(
+          padding: EdgeInsets.all(16),
+          child: Text('No active subscription', textAlign: TextAlign.center),
+        ),
+      );
+    }
+
+    final name = (_currentPlan?['name'] ?? 'Plan').toString();
+    final status = (_currentPlan?['status'] ?? '').toString();
+    final expiry = (_currentPlan?['expiry'] ?? '').toString();
+
+    return _SubscriptionRedOutlinedCard(
+      fillColor: cs.primary.withOpacity(0.10),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 18),
+        child: Column(
+          children: [
+            Text(
+              name,
+              style: Theme.of(context).textTheme.titleLarge?.copyWith(fontWeight: FontWeight.w800),
+              textAlign: TextAlign.center,
+            ),
+            const SizedBox(height: 6),
+            Text(
+              status.isEmpty ? '—' : status,
+              style: Theme.of(context).textTheme.bodyMedium?.copyWith(color: Theme.of(context).colorScheme.onSurface.withOpacity(0.70)),
+              textAlign: TextAlign.center,
+            ),
+            const SizedBox(height: 4),
+            Text(
+              expiry.isEmpty ? 'Expires: —' : 'Expires: $expiry',
+              style: Theme.of(context).textTheme.bodySmall?.copyWith(color: Theme.of(context).colorScheme.onSurface.withOpacity(0.65)),
+              textAlign: TextAlign.center,
+            ),
+          ],
+        ),
+      ),
+    );
   }
 
   @override
   Widget build(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
+    final selected = _plans.firstWhere(
+      (p) => p['id']?.toString() == _selectedPlanId,
+      orElse: () => const <String, dynamic>{},
+    );
+    final selectedName = (selected['name'] ?? '').toString();
+    final selectedPriceId = _selectedPlanId == null ? null : _planFirstPriceId[_selectedPlanId!];
+
     return Center(
       child: ConstrainedBox(
-        constraints: const BoxConstraints(maxWidth: 900),
+        constraints: const BoxConstraints(maxWidth: 520),
         child: ListView(
-          padding: const EdgeInsets.all(24),
+          padding: const EdgeInsets.all(16),
           children: [
             if (_error != null)
-              Card(
-                elevation: 0,
+              _SubscriptionRedOutlinedCard(
                 child: Padding(
                   padding: const EdgeInsets.all(12),
                   child: Text('Failed to load subscription info: $_error'),
                 ),
               ),
-            Card(
-              elevation: 0,
-              child: Padding(
-                padding: const EdgeInsets.all(16),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    const Text('Current Plan',
-                        style: TextStyle(fontWeight: FontWeight.w700)),
-                    const SizedBox(height: 8),
-                    if (_loading && _currentPlan == null)
-                      const Text('Loading...')
-                    else if (_currentPlan == null)
-                      const Text('No active subscription')
-                    else ...[
-                      Text(_currentPlan!['name'] ?? 'Current Plan'),
-                      const SizedBox(height: 4),
-                      Text('Status: ${_currentPlan!['status'] ?? 'N/A'}'),
-                      if (_currentPlan!['expiry'] != null)
-                        Text('Expires: ${_currentPlan!['expiry']}'),
-                      const SizedBox(height: 8),
-                    ],
-                  ],
+            const _SubscriptionSectionHeader(title: 'Current Plan'),
+            const SizedBox(height: 10),
+            _buildCurrentPlanCard(context),
+            const SizedBox(height: 18),
+            const _SubscriptionSectionHeader(title: 'Choose Plan'),
+            const SizedBox(height: 10),
+            if (_loading && _plans.isEmpty)
+              const Padding(
+                padding: EdgeInsets.symmetric(vertical: 18),
+                child: Center(child: CircularProgressIndicator(strokeWidth: 2)),
+              )
+            else if (_plans.isEmpty)
+              const _SubscriptionRedOutlinedCard(
+                child: Padding(
+                  padding: EdgeInsets.all(14),
+                  child: Text('No active plans available.'),
+                ),
+              )
+            else
+              ..._plans.map((p) {
+                final pid = p['id']?.toString() ?? '';
+                final isSelected = pid.isNotEmpty && pid == _selectedPlanId;
+
+                final priceInfo = _planPriceInfo[pid];
+                final amountLabel = priceInfo == null
+                    ? (_planPriceLabel[pid] ?? 'N/A')
+                    : _formatAmount(priceInfo['amount'], (priceInfo['currency'] ?? 'VND').toString());
+                final intervalUnit = (priceInfo?['intervalUnit'] ?? 'month').toString();
+                final intervalCount = int.tryParse((priceInfo?['intervalCount'] ?? 1).toString()) ?? 1;
+                final perLabel = intervalUnit.isEmpty ? '' : '/ ${intervalCount > 1 ? '$intervalCount ' : ''}$intervalUnit';
+
+                return Padding(
+                  padding: const EdgeInsets.only(bottom: 12),
+                  child: _SubscriptionPlanCard(
+                    title: (p['name'] ?? 'Plan').toString(),
+                    price: amountLabel,
+                    per: perLabel,
+                    description: (p['description'] ?? '').toString(),
+                    isSelected: isSelected,
+                    onTap: () {
+                      setState(() {
+                        _selectedPlanId = pid;
+                      });
+                    },
+                  ),
+                );
+              }),
+            const SizedBox(height: 6),
+            SizedBox(
+              width: double.infinity,
+              child: FilledButton(
+                style: FilledButton.styleFrom(
+                  backgroundColor: cs.primary,
+                  foregroundColor: cs.onPrimary,
+                  padding: const EdgeInsets.symmetric(vertical: 14),
+                ),
+                onPressed: (selectedPriceId == null) ? null : () => _startCheckout(selectedPriceId),
+                child: Text(
+                  selectedName.isEmpty ? 'Continue' : 'Continue with plan *$selectedName',
+                  textAlign: TextAlign.center,
                 ),
               ),
             ),
-            const SizedBox(height: 12),
-            Card(
-              elevation: 0,
-              child: Padding(
-                padding: const EdgeInsets.all(16),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    const Text('Available Plans',
-                        style: TextStyle(fontWeight: FontWeight.w700)),
-                    const SizedBox(height: 8),
-                    const Text(
-                        'Unlock VIP perks like ad-free viewing and HD streaming.',
-                        style: TextStyle(color: Colors.white70)),
-                    const SizedBox(height: 12),
-                    if (_loading && _plans.isEmpty)
-                      const Text('Loading...')
-                    else if (_plans.isEmpty)
-                      const Text('No active plans available.')
-                    else
-                      Wrap(
-                        spacing: 12,
-                        runSpacing: 12,
-                        children: _plans.map((p) {
-                          final pid = (p['id'] ?? '').toString();
-                          final priceInfo = _planPriceInfo[pid];
-                          final price = priceInfo == null
-                              ? (_planPriceLabel[pid] ?? 'N/A')
-                              : _formatAmount(
-                                  priceInfo['amount'], priceInfo['currency']);
-                          final intervalUnit =
-                              (priceInfo?['intervalUnit'] ?? 'month')
-                                  .toString();
-                          final intervalCount = int.tryParse(
-                                  (priceInfo?['intervalCount'] ?? 1)
-                                      .toString()) ??
-                              1;
-                          final amountNum = priceInfo != null
-                              ? double.tryParse(
-                                  priceInfo['amount']?.toString() ?? '')
-                              : null;
-                          final isFree =
-                              (amountNum != null && amountNum == 0) ||
-                                  ((_planPriceLabel[pid] ?? '') == 'Free');
-                          final isCurrent =
-                              (_currentPlan?['planId']?.toString() ?? '') ==
-                                  pid;
-                          return SizedBox(
-                            width: 260,
-                            child: Card(
-                              elevation: 0,
-                              color: Colors.grey[900],
-                              child: Padding(
-                                padding: const EdgeInsets.all(12),
-                                child: Column(
-                                  crossAxisAlignment: CrossAxisAlignment.start,
-                                  children: [
-                                    Text(p['name'] ?? 'Plan',
-                                        style: const TextStyle(
-                                            fontWeight: FontWeight.w600,
-                                            fontSize: 16)),
-                                    const SizedBox(height: 6),
-                                    Text(
-                                        '$price / ${intervalCount > 1 ? '$intervalCount ' : ''}$intervalUnit',
-                                        style: const TextStyle(
-                                            color: Colors.white70)),
-                                    if (p['description'] != null) ...[
-                                      const SizedBox(height: 6),
-                                      Text(p['description'],
-                                          maxLines: 2,
-                                          overflow: TextOverflow.ellipsis),
-                                    ],
-                                    const SizedBox(height: 8),
-                                    const Text(
-                                        '• Ad-free viewing\n• HD streaming\n• Early access',
-                                        style:
-                                            TextStyle(color: Colors.white70)),
-                                    const SizedBox(height: 8),
-                                    if (!isCurrent && !isFree)
-                                      Align(
-                                        alignment: Alignment.centerLeft,
-                                        child: FilledButton(
-                                          onPressed:
-                                              _planFirstPriceId[pid] == null
-                                                  ? null
-                                                  : () => _startCheckout(
-                                                      _planFirstPriceId[pid]!),
-                                          child: const Text('Upgrade'),
-                                        ),
-                                      ),
-                                  ],
-                                ),
-                              ),
-                            ),
-                          );
-                        }).toList(),
-                      ),
-                  ],
-                ),
-              ),
+            const SizedBox(height: 14),
+            _SubscriptionBillingHistoryCard(
+              isExpanded: _showBillingHistory,
+              onToggle: () {
+                setState(() {
+                  _showBillingHistory = !_showBillingHistory;
+                });
+              },
+              items: _billingHistory,
             ),
-            const SizedBox(height: 12),
-            Card(
-              elevation: 0,
-              child: const Padding(
-                padding: EdgeInsets.all(16),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text('Billing History',
-                        style: TextStyle(fontWeight: FontWeight.w700)),
-                    SizedBox(height: 8),
-                    Text('Coming soon'),
-                  ],
+            const SizedBox(height: 14),
+            SizedBox(
+              width: double.infinity,
+              child: OutlinedButton(
+                style: OutlinedButton.styleFrom(
+                  foregroundColor: cs.primary,
+                  side: BorderSide(color: cs.primary, width: 1.2),
+                  padding: const EdgeInsets.symmetric(vertical: 14),
                 ),
-              ),
-            ),
-            const SizedBox(height: 12),
-            Card(
-              elevation: 0,
-              child: Padding(
-                padding: const EdgeInsets.all(16),
-                child: Row(
-                  children: const [
-                    Icon(Icons.cancel),
-                    SizedBox(width: 8),
-                    Text('Cancel Subscription'),
-                    SizedBox(width: 12),
-                    Text('Coming soon'),
-                  ],
-                ),
+                onPressed: () {
+                  ScaffoldMessenger.of(context).showSnackBar(
+                      const SnackBar(content: Text('Cancel subscription: coming soon')));
+                },
+                child: const Text('Cancel Subscription'),
               ),
             ),
           ],
         ),
+      ),
+    );
+  }
+}
+
+class _SubscriptionSectionHeader extends StatelessWidget {
+  final String title;
+  const _SubscriptionSectionHeader({required this.title});
+
+  @override
+  Widget build(BuildContext context) {
+    return Text(
+      title,
+      style: Theme.of(context)
+          .textTheme
+          .titleMedium
+          ?.copyWith(fontWeight: FontWeight.w800),
+    );
+  }
+}
+
+class _SubscriptionRedOutlinedCard extends StatelessWidget {
+  final Widget child;
+  final Color? fillColor;
+  const _SubscriptionRedOutlinedCard({required this.child, this.fillColor});
+
+  @override
+  Widget build(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
+    return Container(
+      decoration: BoxDecoration(
+        color: fillColor ?? cs.surface,
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: cs.primary, width: 1.2),
+      ),
+      child: child,
+    );
+  }
+}
+
+class _SubscriptionPlanCard extends StatelessWidget {
+  final String title;
+  final String price;
+  final String per;
+  final String description;
+  final bool isSelected;
+  final VoidCallback onTap;
+
+  const _SubscriptionPlanCard({
+    required this.title,
+    required this.price,
+    required this.per,
+    required this.description,
+    required this.isSelected,
+    required this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
+    final borderColor = isSelected ? cs.primary : cs.outlineVariant;
+
+    return InkWell(
+      onTap: onTap,
+      borderRadius: BorderRadius.circular(14),
+      child: Container(
+        decoration: BoxDecoration(
+          color: cs.surface,
+          borderRadius: BorderRadius.circular(14),
+          border: Border.all(color: borderColor, width: 1.2),
+        ),
+        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+        child: Column(
+          children: [
+            Text(
+              title,
+              style: Theme.of(context)
+                  .textTheme
+                  .titleMedium
+                  ?.copyWith(fontWeight: FontWeight.w800),
+              textAlign: TextAlign.center,
+            ),
+            const SizedBox(height: 6),
+            Text(
+              '$price ${per.trim()}'.trim(),
+              style: Theme.of(context)
+                  .textTheme
+                  .titleSmall
+                  ?.copyWith(fontWeight: FontWeight.w700),
+              textAlign: TextAlign.center,
+            ),
+            if (description.isNotEmpty) ...[
+              const SizedBox(height: 10),
+              Align(
+                alignment: Alignment.centerLeft,
+                child: Text(
+                  description,
+                  style: Theme.of(context)
+                      .textTheme
+                      .bodySmall
+                      ?.copyWith(color: cs.onSurface.withOpacity(0.70)),
+                ),
+              ),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _SubscriptionBillingHistoryCard extends StatelessWidget {
+  final bool isExpanded;
+  final VoidCallback onToggle;
+  final List<Map<String, dynamic>> items;
+
+  const _SubscriptionBillingHistoryCard({
+    required this.isExpanded,
+    required this.onToggle,
+    required this.items,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
+    return _SubscriptionRedOutlinedCard(
+      child: Column(
+        children: [
+          InkWell(
+            onTap: onToggle,
+            borderRadius: BorderRadius.circular(14),
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+              child: Row(
+                children: [
+                  Expanded(
+                    child: Text(
+                      'Show Billing History (i)',
+                      style: Theme.of(context)
+                          .textTheme
+                          .titleSmall
+                          ?.copyWith(fontWeight: FontWeight.w800),
+                    ),
+                  ),
+                  Icon(
+                    isExpanded
+                        ? Icons.keyboard_arrow_up
+                        : Icons.keyboard_arrow_down,
+                    color: cs.primary,
+                  ),
+                ],
+              ),
+            ),
+          ),
+          if (isExpanded)
+            Padding(
+              padding: const EdgeInsets.fromLTRB(14, 0, 14, 12),
+              child: Column(
+                children: [
+                  const Divider(height: 18),
+                  if (items.isEmpty)
+                    Align(
+                      alignment: Alignment.centerLeft,
+                      child: Text(
+                        'No billing history',
+                        style: Theme.of(context).textTheme.bodySmall,
+                      ),
+                    )
+                  else
+                    ...items.map((it) {
+                      final plan = (it['planName'] ?? '').toString();
+                      final status = (it['status'] ?? '').toString();
+                      final date = (it['date'] ?? '').toString();
+
+                      return Padding(
+                        padding: const EdgeInsets.only(top: 10),
+                        child: Container(
+                          width: double.infinity,
+                          decoration: BoxDecoration(
+                            color: cs.surface,
+                            borderRadius: BorderRadius.circular(12),
+                            border: Border.all(
+                                color: cs.primary.withOpacity(0.9), width: 1.0),
+                          ),
+                          padding: const EdgeInsets.all(12),
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text(
+                                plan.isEmpty ? 'SUBSCRIPTION' : plan.toUpperCase(),
+                                style: Theme.of(context)
+                                    .textTheme
+                                    .titleSmall
+                                    ?.copyWith(
+                                      fontWeight: FontWeight.w900,
+                                      color: cs.primary,
+                                    ),
+                              ),
+                              const SizedBox(height: 6),
+                              if (status.isNotEmpty)
+                                Text('Status: $status',
+                                    style: Theme.of(context).textTheme.bodySmall),
+                              if (date.isNotEmpty)
+                                Text(date,
+                                    style: Theme.of(context).textTheme.bodySmall),
+                            ],
+                          ),
+                        ),
+                      );
+                    }),
+                ],
+              ),
+            ),
+        ],
       ),
     );
   }
@@ -3559,7 +7260,50 @@ class _SignInScreenState extends State<SignInScreen> {
             StorageService.saveUserToken(token);
           }
         }
+
+        // Hydrate full profile from /user/me (includes avatar) so the UI
+        // doesn't stick to defaults after login.
+        try {
+          final me = await UserService().getMe();
+          final Map<String, dynamic>? profile = (me['profile'] is Map)
+              ? Map<String, dynamic>.from(me['profile'] as Map)
+              : null;
+
+          final userName =
+              (me['userName'] ?? me['UserName'] ?? me['name'] ?? '').toString();
+          final email = (me['email'] ?? me['Email'] ?? '').toString();
+          final userId = (me['userID'] ?? me['UserID'] ?? me['id'])?.toString();
+          final firstName = (me['firstName'] ?? profile?['firstName'] ?? '')
+              .toString();
+          final lastName =
+              (me['lastName'] ?? profile?['lastName'] ?? '').toString();
+          final avatar =
+              (me['avatar'] ?? profile?['avatar'] ?? '').toString();
+          final gender =
+              (me['gender'] ?? profile?['gender'] ?? '').toString();
+          final dateOfBirth =
+              (me['dateOfBirth'] ?? profile?['dateOfBirth'] ?? '').toString();
+
+          currentUserInfo.value = {
+            'userName': userName,
+            'email': email,
+            if (userId != null) 'userID': userId,
+            if (firstName.isNotEmpty) 'firstName': firstName,
+            if (lastName.isNotEmpty) 'lastName': lastName,
+            if (avatar.isNotEmpty) 'avatar': avatar,
+            if (gender.isNotEmpty) 'gender': gender,
+            if (dateOfBirth.isNotEmpty) 'dateOfBirth': dateOfBirth,
+          };
+          if (avatar.isNotEmpty) {
+            avatarCacheBuster.value =
+                DateTime.now().millisecondsSinceEpoch.toString();
+          }
+        } catch (_) {
+          // ignore: fall back to login response
+        }
+
         isLoggedIn.value = true;
+        unawaited(refreshSavedMoviesForCurrentUser());
         if (!mounted) return;
         context.go('/');
       } else {
@@ -3693,6 +7437,18 @@ class _SignUpScreenState extends State<SignUpScreen> {
   final TextEditingController _confirmController = TextEditingController();
   String? _gender; // start empty so label floats like other fields
   String? _error;
+
+  Future<void> _startGoogleSignUp() async {
+    // For web, Google sign-up is the same as Google sign-in.
+    // Backend creates/links the account during OAuth.
+    final returnUrl = Uri.base.origin;
+    final url = _authService.getGoogleLoginRedirectUrl(returnUrl: returnUrl);
+    try {
+      await launchUrl(Uri.parse(url), mode: LaunchMode.externalApplication);
+    } catch (_) {
+      if (mounted) context.push(url);
+    }
+  }
 
   void _attemptSignup() async {
     if (_usernameController.text.isEmpty ||
@@ -3876,6 +7632,14 @@ class _SignUpScreenState extends State<SignUpScreen> {
                     backgroundColor: Colors.red, foregroundColor: Colors.white),
                 child: const Text('Create account'),
               ),
+
+              const SizedBox(height: 12),
+
+              OutlinedButton.icon(
+                onPressed: _startGoogleSignUp,
+                icon: const Icon(Icons.login),
+                label: const Text('Continue with Google'),
+              ),
               TextButton(
                 onPressed: () => context.go('/signin'),
                 child: const Text('Already have an account? Sign in'),
@@ -4018,14 +7782,152 @@ class ForgotPasswordScreen extends StatefulWidget {
 
 class _ForgotPasswordScreenState extends State<ForgotPasswordScreen> {
   final TextEditingController _emailController = TextEditingController();
-  String? _error;
+  final TextEditingController _codeController = TextEditingController();
+  final TextEditingController _newPasswordController = TextEditingController();
+  final TextEditingController _confirmPasswordController =
+      TextEditingController();
 
-  void _submit() {
-    if (!_emailController.text.contains('@')) {
+  final AuthService _authService = AuthService();
+
+  String? _error;
+  bool _isLoading = false;
+  bool _showNewPassword = false;
+  bool _showConfirmPassword = false;
+
+  _CleanForgotStage _stage = _CleanForgotStage.email;
+  String? _ticket;
+
+  bool _isOk(Map<String, dynamic> res) {
+    final s = res['success'];
+    if (s == true) return true;
+    final ec = res['errorCode'];
+    if (ec is int && ec >= 200 && ec < 300) return true;
+    return false;
+  }
+
+  String _messageFrom(Map<String, dynamic> res, String fallback) {
+    final msg = res['errorMessage'] ?? res['message'] ?? res['Message'];
+    if (msg is String && msg.trim().isNotEmpty) return msg;
+    return fallback;
+  }
+
+  Future<void> _start() async {
+    final email = _emailController.text.trim();
+    if (!email.contains('@')) {
       setState(() => _error = 'Enter a valid email.');
       return;
     }
-    context.go('/check-email');
+    setState(() {
+      _isLoading = true;
+      _error = null;
+    });
+    try {
+      final res = await _authService.startForgotPasswordByEmail(email);
+      if (!mounted) return;
+      if (_isOk(res)) {
+        setState(() {
+          _stage = _CleanForgotStage.verify;
+          _codeController.text = '';
+        });
+      } else {
+        setState(() =>
+            _error = _messageFrom(res, 'Failed to send verification code'));
+      }
+    } finally {
+      if (mounted) setState(() => _isLoading = false);
+    }
+  }
+
+  Future<void> _verify() async {
+    final code = _codeController.text.trim();
+    if (code.length != 6) {
+      setState(() => _error = 'Enter the 6-digit code.');
+      return;
+    }
+
+    setState(() {
+      _isLoading = true;
+      _error = null;
+    });
+
+    try {
+      final res = await _authService.verifyForgotPasswordByEmail(
+        email: _emailController.text.trim(),
+        code: code,
+      );
+      if (!mounted) return;
+
+      if (_isOk(res)) {
+        final dynamic data = res['data'] ?? res['Data'] ?? res;
+        final ticket = (data is String) ? data : null;
+        if (ticket == null || ticket.trim().isEmpty) {
+          setState(
+              () => _error = 'Missing verification ticket. Please try again.');
+          return;
+        }
+        setState(() {
+          _ticket = ticket;
+          _stage = _CleanForgotStage.commit;
+          _newPasswordController.text = '';
+          _confirmPasswordController.text = '';
+          _showNewPassword = false;
+          _showConfirmPassword = false;
+        });
+      } else {
+        setState(() => _error = _messageFrom(res, 'Invalid verification code'));
+      }
+    } finally {
+      if (mounted) setState(() => _isLoading = false);
+    }
+  }
+
+  Future<void> _commit() async {
+    final ticket = _ticket;
+    if (ticket == null || ticket.isEmpty) {
+      setState(() => _error = 'Missing ticket. Please restart.');
+      return;
+    }
+
+    final p1 = _newPasswordController.text.trim();
+    final p2 = _confirmPasswordController.text.trim();
+    if (p1.length < 6) {
+      setState(() => _error = 'New password must be at least 6 characters.');
+      return;
+    }
+    if (p1 != p2) {
+      setState(() => _error = 'Passwords do not match.');
+      return;
+    }
+
+    setState(() {
+      _isLoading = true;
+      _error = null;
+    });
+
+    try {
+      final res = await _authService.commitForgotPassword(
+        ticket: ticket,
+        newPassword: p1,
+      );
+      if (!mounted) return;
+
+      if (_isOk(res)) {
+        setState(() => _stage = _CleanForgotStage.done);
+      } else {
+        setState(() => _error = _messageFrom(res, 'Failed to reset password'));
+      }
+    } finally {
+      if (mounted) setState(() => _isLoading = false);
+    }
+  }
+
+  @override
+  void dispose() {
+    _emailController.dispose();
+    _codeController.dispose();
+    _newPasswordController.dispose();
+    _confirmPasswordController.dispose();
+    super.dispose();
   }
 
   @override
@@ -4053,26 +7955,163 @@ class _ForgotPasswordScreenState extends State<ForgotPasswordScreen> {
                     fontWeight: FontWeight.bold),
               ),
               const SizedBox(height: 18),
-              TextField(
-                controller: _emailController,
-                style: const TextStyle(color: Colors.white),
-                decoration: const InputDecoration(
-                  labelText: 'Email',
-                  labelStyle: TextStyle(color: Colors.white70),
-                  enabledBorder: UnderlineInputBorder(
-                      borderSide: BorderSide(color: Colors.white24)),
-                  focusedBorder: UnderlineInputBorder(
-                      borderSide: BorderSide(color: Colors.red)),
+              if (_stage == _CleanForgotStage.email) ...[
+                TextField(
+                  controller: _emailController,
+                  style: const TextStyle(color: Colors.white),
+                  decoration: const InputDecoration(
+                    labelText: 'Email',
+                    labelStyle: TextStyle(color: Colors.white70),
+                    enabledBorder: UnderlineInputBorder(
+                        borderSide: BorderSide(color: Colors.white24)),
+                    focusedBorder: UnderlineInputBorder(
+                        borderSide: BorderSide(color: Colors.red)),
+                  ),
+                  onSubmitted: (_) => _start(),
                 ),
-                onSubmitted: (_) => _submit(),
-              ),
-              const SizedBox(height: 24),
-              ElevatedButton(
-                onPressed: _submit,
-                style: ElevatedButton.styleFrom(
-                    backgroundColor: Colors.red, foregroundColor: Colors.white),
-                child: const Text('Send reset link'),
-              ),
+                const SizedBox(height: 24),
+                ElevatedButton(
+                  onPressed: _isLoading ? null : _start,
+                  style: ElevatedButton.styleFrom(
+                      backgroundColor: Colors.red,
+                      foregroundColor: Colors.white),
+                  child: _isLoading
+                      ? const SizedBox(
+                          height: 20,
+                          width: 20,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        )
+                      : const Text('Send code'),
+                ),
+              ] else if (_stage == _CleanForgotStage.verify) ...[
+                TextField(
+                  controller: _codeController,
+                  keyboardType: TextInputType.number,
+                  inputFormatters: [
+                    FilteringTextInputFormatter.digitsOnly,
+                    LengthLimitingTextInputFormatter(6),
+                  ],
+                  style: const TextStyle(color: Colors.white),
+                  decoration: const InputDecoration(
+                    labelText: 'Verification code',
+                    labelStyle: TextStyle(color: Colors.white70),
+                    enabledBorder: UnderlineInputBorder(
+                        borderSide: BorderSide(color: Colors.white24)),
+                    focusedBorder: UnderlineInputBorder(
+                        borderSide: BorderSide(color: Colors.red)),
+                  ),
+                  onSubmitted: (_) => _verify(),
+                ),
+                const SizedBox(height: 24),
+                ElevatedButton(
+                  onPressed: _isLoading ? null : _verify,
+                  style: ElevatedButton.styleFrom(
+                      backgroundColor: Colors.red,
+                      foregroundColor: Colors.white),
+                  child: _isLoading
+                      ? const SizedBox(
+                          height: 20,
+                          width: 20,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        )
+                      : const Text('Verify code'),
+                ),
+                TextButton(
+                  onPressed: _isLoading
+                      ? null
+                      : () {
+                          setState(() {
+                            _stage = _CleanForgotStage.email;
+                            _codeController.text = '';
+                          });
+                        },
+                  child: const Text('Change email'),
+                ),
+                TextButton(
+                  onPressed: _isLoading ? null : _start,
+                  child: const Text('Resend code'),
+                ),
+              ] else if (_stage == _CleanForgotStage.commit) ...[
+                TextField(
+                  controller: _newPasswordController,
+                  obscureText: !_showNewPassword,
+                  style: const TextStyle(color: Colors.white),
+                  decoration: InputDecoration(
+                    labelText: 'New password',
+                    labelStyle: const TextStyle(color: Colors.white70),
+                    enabledBorder: const UnderlineInputBorder(
+                        borderSide: BorderSide(color: Colors.white24)),
+                    focusedBorder: const UnderlineInputBorder(
+                        borderSide: BorderSide(color: Colors.red)),
+                    suffixIcon: IconButton(
+                      onPressed: () =>
+                          setState(() => _showNewPassword = !_showNewPassword),
+                      icon: Icon(
+                        _showNewPassword
+                            ? Icons.visibility_off
+                            : Icons.visibility,
+                        color: Colors.white70,
+                      ),
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 12),
+                TextField(
+                  controller: _confirmPasswordController,
+                  obscureText: !_showConfirmPassword,
+                  style: const TextStyle(color: Colors.white),
+                  decoration: InputDecoration(
+                    labelText: 'Confirm password',
+                    labelStyle: const TextStyle(color: Colors.white70),
+                    enabledBorder: const UnderlineInputBorder(
+                        borderSide: BorderSide(color: Colors.white24)),
+                    focusedBorder: const UnderlineInputBorder(
+                        borderSide: BorderSide(color: Colors.red)),
+                    suffixIcon: IconButton(
+                      onPressed: () => setState(
+                          () => _showConfirmPassword = !_showConfirmPassword),
+                      icon: Icon(
+                        _showConfirmPassword
+                            ? Icons.visibility_off
+                            : Icons.visibility,
+                        color: Colors.white70,
+                      ),
+                    ),
+                  ),
+                  onSubmitted: (_) => _commit(),
+                ),
+                const SizedBox(height: 24),
+                ElevatedButton(
+                  onPressed: _isLoading ? null : _commit,
+                  style: ElevatedButton.styleFrom(
+                      backgroundColor: Colors.red,
+                      foregroundColor: Colors.white),
+                  child: _isLoading
+                      ? const SizedBox(
+                          height: 20,
+                          width: 20,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        )
+                      : const Text('Reset password'),
+                ),
+              ] else ...[
+                const Icon(Icons.check_circle_outline,
+                    color: Colors.red, size: 64),
+                const SizedBox(height: 16),
+                const Text(
+                  'Password reset successfully. Please sign in again.',
+                  textAlign: TextAlign.center,
+                  style: TextStyle(color: Colors.white70, fontSize: 16),
+                ),
+                const SizedBox(height: 24),
+                ElevatedButton(
+                  onPressed: () => context.go('/signin'),
+                  style: ElevatedButton.styleFrom(
+                      backgroundColor: Colors.red,
+                      foregroundColor: Colors.white),
+                  child: const Text('Return to Sign in'),
+                ),
+              ],
               TextButton(
                 onPressed: () => context.go('/signin'),
                 child: const Text('Back to Sign in'),
@@ -4091,6 +8130,8 @@ class _ForgotPasswordScreenState extends State<ForgotPasswordScreen> {
     );
   }
 }
+
+enum _CleanForgotStage { email, verify, commit, done }
 
 class CheckEmailScreen extends StatelessWidget {
   const CheckEmailScreen({super.key});

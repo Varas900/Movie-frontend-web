@@ -1,8 +1,19 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:go_router/go_router.dart';
 
 import '../../../core/models/comment_model.dart';
+import '../../../core/providers/auth_provider.dart';
+import '../../../core/routing/app_router.dart';
+import '../../../core/utils/authz_prompt.dart';
+import '../../../core/utils/url_utils.dart';
 import '../providers/comments_provider.dart';
+
+class GroupedComments {
+  final List<Comment> parents;
+  final Map<int, List<Comment>> repliesByParent;
+  GroupedComments(this.parents, this.repliesByParent);
+}
 
 class CommentsSection extends ConsumerStatefulWidget {
   final int movieId;
@@ -25,13 +36,14 @@ class _CommentsSectionState extends ConsumerState<CommentsSection> {
   }
 
   Future<void> _postComment() async {
-    final canPost = ref.read(canPostCommentProvider);
     final userId = ref.read(currentUserIdProvider);
     final text = _controller.text.trim();
 
-    if (!canPost || userId == null) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Please sign in to comment')),
+    if (userId == null) {
+      await showAuthzPromptDialog(
+        context,
+        type: AuthzPromptType.signIn,
+        onPrimary: () => context.go(AppRoutes.signin),
       );
       return;
     }
@@ -39,12 +51,39 @@ class _CommentsSectionState extends ConsumerState<CommentsSection> {
 
     setState(() => _isPosting = true);
     final repo = ref.read(commentsRepositoryProvider);
-    final ok = await repo.createComment(
-      movieId: widget.movieId,
-      userId: userId,
-      content: text,
-      parentId: _replyingTo,
-    );
+    bool ok = false;
+    try {
+      ok = await repo.createComment(
+        movieId: widget.movieId,
+        userId: userId,
+        content: text,
+        parentId: _replyingTo,
+      );
+    } catch (e) {
+      final prompt = authzPromptFromError(e);
+      if (prompt == AuthzPromptType.signIn) {
+        if (!mounted) return;
+        await showAuthzPromptDialog(
+          context,
+          type: AuthzPromptType.signIn,
+          onPrimary: () async {
+            await ref.read(authProvider.notifier).signOut();
+            if (context.mounted) context.go(AppRoutes.signin);
+          },
+        );
+        return;
+      }
+      if (prompt == AuthzPromptType.buyPlan) {
+        if (!mounted) return;
+        await showAuthzPromptDialog(
+          context,
+          type: AuthzPromptType.buyPlan,
+          onPrimary: () => context.go('${AppRoutes.profile}?tab=subscription'),
+        );
+        return;
+      }
+      ok = false;
+    }
     setState(() => _isPosting = false);
 
     if (ok) {
@@ -61,6 +100,7 @@ class _CommentsSectionState extends ConsumerState<CommentsSection> {
   @override
   Widget build(BuildContext context) {
     final commentsAsync = ref.watch(commentsProvider(widget.movieId));
+    final commentersAsync = ref.watch(commenterProfilesByMovieProvider(widget.movieId));
 
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
@@ -79,6 +119,7 @@ class _CommentsSectionState extends ConsumerState<CommentsSection> {
             if (comments.isEmpty) {
               return const Text('No comments yet');
             }
+            final commenterMap = commentersAsync.value ?? const <int, CommenterProfile>{};
             final grouped = _groupComments(comments);
             final parents = grouped.parents;
             final replies = grouped.repliesByParent;
@@ -90,7 +131,8 @@ class _CommentsSectionState extends ConsumerState<CommentsSection> {
                   ],
                 ),
                 const SizedBox(height: 8),
-                ...parents.map((c) => _buildCommentItem(c, replies[c.commentID] ?? const [])),
+                ...parents.map((c) =>
+                    _buildCommentItem(c, replies[c.commentID] ?? const [], commenterMap)),
               ],
             );
           },
@@ -100,11 +142,16 @@ class _CommentsSectionState extends ConsumerState<CommentsSection> {
   }
 
   Widget _buildComposer() {
-    final canPost = ref.watch(canPostCommentProvider);
+    final isAuthed = ref.watch(isAuthenticatedProvider);
+    final me = ref.watch(currentUserProvider);
+    final avatarUrl = resolveApiUrl(me?.avatar);
     return Row(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        CircleAvatar(child: Icon(Icons.person)),
+        CircleAvatar(
+          backgroundImage: avatarUrl.isNotEmpty ? NetworkImage(avatarUrl) : null,
+          child: avatarUrl.isEmpty ? const Icon(Icons.person) : null,
+        ),
         const SizedBox(width: 12),
         Expanded(
           child: Column(
@@ -114,10 +161,10 @@ class _CommentsSectionState extends ConsumerState<CommentsSection> {
                 maxLines: 3,
                 minLines: 1,
                 decoration: InputDecoration(
-                  hintText: canPost ? 'Write a comment...' : 'Sign in to comment',
+                  hintText: isAuthed ? 'Write a comment...' : 'Sign in to comment',
                   border: const OutlineInputBorder(),
                 ),
-                enabled: canPost && !_isPosting,
+                enabled: !_isPosting,
               ),
               const SizedBox(height: 8),
               Align(
@@ -134,7 +181,19 @@ class _CommentsSectionState extends ConsumerState<CommentsSection> {
     );
   }
 
-  Widget _buildCommentItem(Comment c, List<Comment> replies) {
+  Widget _buildCommentItem(
+      Comment c, List<Comment> replies, Map<int, CommenterProfile> commenterMap) {
+    final me = ref.watch(currentUserProvider);
+    final meId = me?.userId;
+    final isMe = meId != null && c.userID == meId;
+    final other = commenterMap[c.userID];
+    final displayName = isMe
+        ? (me?.userName)
+        : (other?.userName.isNotEmpty == true ? other!.userName : c.userName);
+    final avatarUrl = isMe
+        ? resolveApiUrl(me?.avatar)
+        : resolveApiUrl(other?.avatar);
+
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 8),
       child: Column(
@@ -143,7 +202,14 @@ class _CommentsSectionState extends ConsumerState<CommentsSection> {
           Row(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              CircleAvatar(child: Text((c.userName?.isNotEmpty == true ? c.userName![0] : 'U').toUpperCase())),
+              CircleAvatar(
+                backgroundImage: avatarUrl.isNotEmpty ? NetworkImage(avatarUrl) : null,
+                child: avatarUrl.isNotEmpty
+                    ? null
+                    : Text(
+                        ((displayName?.isNotEmpty == true ? displayName![0] : 'U')).toUpperCase(),
+                      ),
+              ),
               const SizedBox(width: 12),
               Expanded(
                 child: Column(
@@ -151,7 +217,7 @@ class _CommentsSectionState extends ConsumerState<CommentsSection> {
                   children: [
                     Row(
                       children: [
-                        Text(c.userName ?? 'User', style: Theme.of(context).textTheme.titleSmall),
+                        Text(displayName ?? 'User', style: Theme.of(context).textTheme.titleSmall),
                         const SizedBox(width: 8),
                         Text(_formatDate(c.createdAt), style: Theme.of(context).textTheme.bodySmall),
                       ],
@@ -171,7 +237,8 @@ class _CommentsSectionState extends ConsumerState<CommentsSection> {
                       ],
                     ),
                     if (_replyingTo == c.commentID) _buildReplyComposer(parentId: c.commentID),
-                    if (replies.isNotEmpty) _buildRepliesList(replies),
+                    if (replies.isNotEmpty)
+                      _buildRepliesList(replies, commenterMap),
                   ],
                 ),
               ),
@@ -186,17 +253,52 @@ class _CommentsSectionState extends ConsumerState<CommentsSection> {
     final replyController = TextEditingController();
 
     Future<void> submitReply() async {
-      final canPost = ref.read(canPostCommentProvider);
       final userId = ref.read(currentUserIdProvider);
       final text = replyController.text.trim();
-      if (!canPost || userId == null) {
-        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Please sign in to reply')));
+      if (userId == null) {
+        await showAuthzPromptDialog(
+          context,
+          type: AuthzPromptType.signIn,
+          onPrimary: () => context.go(AppRoutes.signin),
+        );
         return;
       }
       if (text.isEmpty) return;
       setState(() => _isPosting = true);
       final repo = ref.read(commentsRepositoryProvider);
-      final ok = await repo.createComment(movieId: widget.movieId, userId: userId, content: text, parentId: parentId);
+      bool ok = false;
+      try {
+        ok = await repo.createComment(
+          movieId: widget.movieId,
+          userId: userId,
+          content: text,
+          parentId: parentId,
+        );
+      } catch (e) {
+        final prompt = authzPromptFromError(e);
+        if (prompt == AuthzPromptType.signIn) {
+          if (!mounted) return;
+          await showAuthzPromptDialog(
+            context,
+            type: AuthzPromptType.signIn,
+            onPrimary: () async {
+              await ref.read(authProvider.notifier).signOut();
+              if (context.mounted) context.go(AppRoutes.signin);
+            },
+          );
+          return;
+        }
+        if (prompt == AuthzPromptType.buyPlan) {
+          if (!mounted) return;
+          await showAuthzPromptDialog(
+            context,
+            type: AuthzPromptType.buyPlan,
+            onPrimary: () => context.go('${AppRoutes.profile}?tab=subscription'),
+          );
+          return;
+        }
+        ok = false;
+      }
       setState(() => _isPosting = false);
       if (ok) {
         ref.invalidate(commentsProvider(widget.movieId));
@@ -228,15 +330,41 @@ class _CommentsSectionState extends ConsumerState<CommentsSection> {
     );
   }
 
-  Widget _buildRepliesList(List<Comment> replies) {
+  Widget _buildRepliesList(
+      List<Comment> replies, Map<int, CommenterProfile> commenterMap) {
+    final me = ref.watch(currentUserProvider);
+    final meId = me?.userId;
     return Padding(
       padding: const EdgeInsets.only(top: 8, left: 24),
       child: Column(
         children: replies.map((r) {
+          final isMe = meId != null && r.userID == meId;
+          final other = commenterMap[r.userID];
+          final displayName = isMe
+              ? me?.userName
+              : (other?.userName.isNotEmpty == true
+                  ? other!.userName
+                  : (r.userName ?? 'User'));
+          final avatarUrl = isMe
+              ? resolveApiUrl(me?.avatar)
+              : resolveApiUrl(other?.avatar);
           return Row(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              CircleAvatar(radius: 14, child: Text((r.userName?.isNotEmpty == true ? r.userName![0] : 'U').toUpperCase(), style: const TextStyle(fontSize: 12))),
+              CircleAvatar(
+                radius: 14,
+                backgroundImage:
+                    avatarUrl.isNotEmpty ? NetworkImage(avatarUrl) : null,
+                child: avatarUrl.isNotEmpty
+                    ? null
+                    : Text(
+                        ((displayName?.isNotEmpty == true
+                                ? displayName![0]
+                                : 'U'))
+                            .toUpperCase(),
+                        style: const TextStyle(fontSize: 12),
+                      ),
+              ),
               const SizedBox(width: 8),
               Expanded(
                 child: Column(
@@ -244,7 +372,8 @@ class _CommentsSectionState extends ConsumerState<CommentsSection> {
                   children: [
                     Row(
                       children: [
-                        Text(r.userName ?? 'User', style: Theme.of(context).textTheme.titleSmall),
+                        Text(displayName ?? 'User',
+                            style: Theme.of(context).textTheme.titleSmall),
                         const SizedBox(width: 8),
                         Text(_formatDate(r.createdAt), style: Theme.of(context).textTheme.bodySmall),
                       ],
@@ -259,12 +388,6 @@ class _CommentsSectionState extends ConsumerState<CommentsSection> {
         }).toList(),
       ),
     );
-  }
-
-  class GroupedComments {
-    final List<Comment> parents;
-    final Map<int, List<Comment>> repliesByParent;
-    GroupedComments(this.parents, this.repliesByParent);
   }
 
   GroupedComments _groupComments(List<Comment> all) {
